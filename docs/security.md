@@ -1,0 +1,5 @@
+# Security
+
+The renderer is sandboxed with Node integration disabled and context isolation enabled. A restrictive Content Security Policy disallows inline scripts, objects, forms, framing, and remote renderer code. The packaged policy carries no inline escape hatch; the development policy additionally permits inline scripts and styles because the Vite dev server injects an inline React Fast Refresh preamble. IPC channels are explicitly declared, sender-checked, and runtime validated; there is no generic filesystem, process, or command channel. Project roots and filesystem targets are canonicalized, including symlink resolution. External navigation and new windows are denied, with HTTPS links delegated to the operating system.
+
+App-managed secrets use OS-backed Electron `safeStorage`. Normalized events are recursively redacted before persistence or renderer delivery. Permission responses are bound to the originating session, destructive approvals cannot be remembered for the session in the UI, and pending approvals fail closed on shutdown.

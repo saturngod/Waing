@@ -1,0 +1,44 @@
+# Dependencies and package-manager state. npm only: another manager's store or lockfile must never be committed.
+node_modules/
+.npm-cache/
+.pnpm-store/
+pnpm-lock.yaml
+yarn.lock
+
+# Build output. `packages/*/generated/` is deliberately NOT ignored: those Codex protocol types are committed so a
+# fresh checkout typechecks without the Codex CLI installed.
+dist/
+out/
+release/
+*.tsbuildinfo
+
+# Test and tooling artifacts
+playwright-report/
+blob-report/
+test-results/
+coverage/
+.eslintcache
+.vite/
+*.log
+
+# Local runtime data. The app database lives in Electron's userData, but keep stray copies and exports out of git.
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+waing-diagnostics-*.json
+
+# Secrets and machine-specific configuration
+.env
+.env.*
+!.env.example
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Agent tooling: shared project settings are committed, personal overrides are not.
+.claude/settings.local.json
