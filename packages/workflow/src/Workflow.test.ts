@@ -4,6 +4,7 @@ import type {
   RoleExecutionProfile, RouterCheckpointInput, RouterOrchestrationDecision, WorkflowArtifactRef, WorkflowRole,
   WorkflowDefinition, WorkflowStepResult,
 } from "@waing/domain";
+import { mergeSharedState } from "./ContextStore";
 import { ProfileResolver } from "./ProfileResolver";
 import type { GlobalRoleProfiles } from "./ProfileResolver";
 import type { StepExecutionInput, WorkflowStepExecutor } from "./StepExecutor";
@@ -58,6 +59,27 @@ class FakeStepExecutor implements WorkflowStepExecutor {
       ...(verdict === undefined ? {} : { reviewVerdict: verdict, findings: verdict === "fail" ? [{ id: `finding-${this.calls.length}`,
         severity: "high", category: "correctness", title: "Broken behavior", description: "Fix it" }] : [],
         unresolvedIssues: verdict === "fail" ? ["Broken behavior"] : [] }) });
+  }
+}
+
+/** Amends the shared state on every step, the way a real agent would through its `waing-state` block. */
+class StatefulStepExecutor extends FakeStepExecutor {
+  override async execute(input: StepExecutionInput): Promise<WorkflowStepResult> {
+    const result = await super.execute(input);
+    return { ...result, stateUpdate: { planItems: [{ id: `p${String(this.calls.length)}`,
+      title: `${input.node.label} plan item`, status: "done" }], decisions: [`Decided at ${input.node.id}`] } };
+  }
+}
+
+/** Mimics a provider with persistent sessions: one session id per agent, reused whenever the engine offers it back. */
+class SessionedStepExecutor extends FakeStepExecutor {
+  private readonly sessions = new Map<string, string>();
+  override async execute(input: StepExecutionInput): Promise<WorkflowStepResult> {
+    const result = await super.execute(input);
+    const existing = input.resumeProviderSessionId ?? this.sessions.get(input.profile.agentId);
+    const providerSessionId = existing ?? `${input.profile.agentId}-session`;
+    this.sessions.set(input.profile.agentId, providerSessionId);
+    return { ...result, providerSessionId };
   }
 }
 
@@ -211,7 +233,7 @@ describe("WorkflowEngine", () => {
     expect(executor.calls[0]?.profile).toMatchObject({ role: "planning", mode: "plan" });
   });
 
-  it("gives the adaptive reviewer the implementation diff and loops through bugfix on FAIL", async () => {
+  it("gives only the reviewer the diff and hands every other role the changed paths instead", async () => {
     const executor = new DiffStepExecutor(["fail", "pass"]);
     const result = await new WorkflowEngine(new InMemoryWorkflowRepository(), executor,
       new QueueRouter([decision("execute_medium"), decision("review"), decision("complete")])).run({
@@ -220,7 +242,59 @@ describe("WorkflowEngine", () => {
     expect(result.run.status).toBe("completed");
     expect(executor.calls.map((call) => call.node.id)).toEqual(["medium", "review", "fix", "review"]);
     expect(executor.calls.find((call) => call.node.id === "review")?.handoff.currentDiff).toContain("src/index.ts");
-    expect(executor.calls.find((call) => call.node.id === "fix")?.handoff.currentDiff).toContain("src/index.ts");
+    // A bugfix step shares the reviewer's workspace, so it gets the paths and re-reads them rather than carrying a
+    // second copy of the diff through the packet.
+    const fix = executor.calls.find((call) => call.node.id === "fix")?.handoff;
+    expect(fix?.currentDiff).toBeUndefined();
+    expect(fix?.changedFiles).toContain("src/index.ts");
+  });
+
+  it("resumes an agent's own provider session and stops re-sending the history that session already holds", async () => {
+    // medium and fix both run on codex; review runs on antigravity in between.
+    const executor = new SessionedStepExecutor(["fail", "pass"]);
+    const result = await new WorkflowEngine(new InMemoryWorkflowRepository(), executor,
+      new QueueRouter([decision("execute_medium"), decision("review"), decision("complete")])).run({
+      definition: new WorkflowCompiler().compilePreset("adaptive"), profiles, projectId: "p", projectRoot: "/tmp",
+      task: "Risky change" });
+    expect(result.run.status).toBe("completed");
+    expect(result.context.providerSessions).toMatchObject({ codex: "codex-session", antigravity: "antigravity-session" });
+
+    const fix = executor.calls.find((call) => call.node.id === "fix");
+    expect(fix?.resumeProviderSessionId).toBe("codex-session");
+    expect(fix?.handoff.providerSessionRetained).toBe(true);
+    // The medium step ran in the very session being resumed, so codex already has it; only the reviewer's work travels.
+    expect(fix?.handoff.priorStepSummaries.map((entry) => entry.role)).toEqual(["review"]);
+    // The reviewer is a different provider and gets no resume, so it still receives the implementation history.
+    const review = executor.calls.find((call) => call.node.id === "review");
+    expect(review?.resumeProviderSessionId).toBeUndefined();
+    expect(review?.handoff.priorStepSummaries.map((entry) => entry.role)).toEqual(["medium"]);
+    // Blockers are never dropped, even when the rest of the history is.
+    expect(fix?.handoff.unresolvedIssues).toEqual(["Broken behavior"]);
+  });
+
+  it("accumulates shared state across steps and hands it whole to every later step", async () => {
+    const executor = new StatefulStepExecutor(["pass"]);
+    const result = await new WorkflowEngine(new InMemoryWorkflowRepository(), executor,
+      new QueueRouter([decision("execute_medium"), decision("review"), decision("complete")])).run({
+      definition: new WorkflowCompiler().compilePreset("adaptive"), profiles, projectId: "p", projectRoot: "/tmp",
+      task: "Ship it" });
+    expect(result.run.status).toBe("completed");
+    expect(result.context.sharedState.planItems.map((item) => item.id)).toEqual(["p1", "p2"]);
+    expect(result.context.sharedState.decisions).toEqual(["Decided at medium", "Decided at review"]);
+    // The first step has nothing to inherit; the reviewer inherits everything the implementation recorded.
+    expect(executor.calls[0]?.handoff.sharedState).toBeUndefined();
+    expect(executor.calls[1]?.handoff.sharedState).toEqual({ planItems: [{ id: "p1", title: "Medium Level Task plan item",
+      status: "done" }], decisions: ["Decided at medium"], openQuestions: [] });
+  });
+
+  it("revises a plan item in place by id instead of accumulating duplicates", () => {
+    const merged = mergeSharedState({ planItems: [{ id: "p1", title: "Parse", status: "pending" }],
+      decisions: ["Reuse the lexer"], openQuestions: [] },
+    { planItems: [{ id: "p1", title: "Parse", status: "done" }, { id: "p2", title: "Emit", status: "pending" }],
+      decisions: ["Reuse the lexer", "Emit lazily"] });
+    expect(merged.planItems).toEqual([{ id: "p1", title: "Parse", status: "done" },
+      { id: "p2", title: "Emit", status: "pending" }]);
+    expect(merged.decisions).toEqual(["Reuse the lexer", "Emit lazily"]);
   });
 
   it("rejects a router action outside the node allowlist and bounds repeated decisions without state change", async () => {

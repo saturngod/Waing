@@ -6,6 +6,8 @@ import type {
   WorkflowNextActionKind, WorkflowNode, WorkflowRole, WorkflowRun,
 } from "@waing/domain";
 import { renderAnnouncement } from "./AnnouncementRenderer";
+import { clip, compactDiff, compactHistory, DEFAULT_COMPACTION_BUDGET, dedupe, latestTestPerCommand, withoutDiff } from "./ContextCompactor";
+import type { CompactionBudget } from "./ContextCompactor";
 import { ContextStore } from "./ContextStore";
 import { ProfileResolver } from "./ProfileResolver";
 import type { GlobalRoleProfiles } from "./ProfileResolver";
@@ -36,7 +38,8 @@ export class WorkflowEngine {
 
   constructor(private readonly repository: WorkflowRepository, private readonly executor: WorkflowStepExecutor,
     private readonly router: WorkflowRouter, readonly events = new WorkflowEventBus(), private readonly validator = new WorkflowValidator(),
-    private readonly routerPolicy: RouterLoopPolicy = { maxRouterDecisions: 12, maxSameActionWithoutStateChange: 2, onExhausted: "ask_user" }) {}
+    private readonly routerPolicy: RouterLoopPolicy = { maxRouterDecisions: 12, maxSameActionWithoutStateChange: 2, onExhausted: "ask_user" },
+    private readonly compaction: CompactionBudget = DEFAULT_COMPACTION_BUDGET) {}
 
   async run(input: WorkflowStartInput): Promise<{ run: WorkflowRun; context: WorkflowContext }> {
     const definition = this.validator.validate(input.definition, input.profiles);
@@ -46,7 +49,8 @@ export class WorkflowEngine {
     this.currentRun = run; await this.transition(run, "validating");
     const context: WorkflowContext = { workflowRunId: run.id, projectId: input.projectId, projectRoot: input.projectRoot,
       originalUserTask: input.task, stateVersion: 0, routerDecisionCount: 0, routerDecisionHistory: [],
-      activeNodeId: definition.entryNodeId, completedNodeIds: [], stepResults: [], artifacts: [], loopState: {} };
+      activeNodeId: definition.entryNodeId, completedNodeIds: [], stepResults: [], artifacts: [], loopState: {},
+      providerSessions: {}, sharedState: { planItems: [], decisions: [], openQuestions: [] } };
     this.currentContext = context;
     const store = new ContextStore(this.repository); await store.initialize(context); await this.transition(run, "ready");
     this.events.publish({ type: "workflow.started", workflowRunId: run.id });
@@ -77,12 +81,15 @@ export class WorkflowEngine {
         await this.repository.saveAnnouncement?.(announcement);
         this.events.publish({ type: "workflow.step.announced", announcement });
         this.events.publish({ type: "workflow.node.started", nodeId: node.id, stepRunId });
+        const retained = context.providerSessions[profile.agentId];
         const result = await this.executor.execute({ stepRunId, node, profile, context,
-          handoff: this.handoff(context, node),
+          handoff: this.handoff(context, node, retained),
+          ...(retained === undefined ? {} : { resumeProviderSessionId: retained }),
           ...(node.type === "role_task" && node.role === "bugfix" ? { fixPacket: this.fixPacket(context) } : {}),
           ...(node.type === "document" ? { documentInput: this.documentInput(context, node) } : {}),
           signal: this.controller.signal });
         await store.recordStep(context, result);
+        if (result.providerSessionId !== undefined) context.providerSessions[profile.agentId] = result.providerSessionId;
         for (const artifact of result.artifacts) this.events.publish({ type: "workflow.artifact.created", artifactId: artifact.id });
         if (result.status !== "completed") throw new AgentError(result.status === "cancelled" ? "CANCELLED" : "PROCESS_FAILED",
           result.summary, profile.agentId, result.status === "failed", true);
@@ -122,13 +129,17 @@ export class WorkflowEngine {
     await this.repository.saveAnnouncement?.(announcement);
     this.events.publish({ type: "workflow.step.announced", announcement });
     this.events.publish({ type: "workflow.router.started", nodeId: node.id, checkpointReason: reason });
+    // The router only picks the next action, so it never needs a diff — and `latestStepResult` would otherwise carry
+    // the whole one. It is also excluded from the history, which would repeat it a second time.
+    const latest = context.stepResults.at(-1);
+    const history = compactHistory(context.stepResults, this.compaction, latest === undefined ? 0 : 1);
     const checkpoint = routerCheckpointInputSchema.parse({ checkpointReason: reason, originalUserTask: context.originalUserTask,
-      ...(context.stepResults.at(-1) === undefined ? {} : { latestStepResult: context.stepResults.at(-1) }),
+      ...(latest === undefined ? {} : { latestStepResult: withoutDiff(latest, this.compaction) }),
       ...(this.latestReview(context) === undefined ? {} : { latestReview: this.latestReview(context) }),
       ...(context.artifacts.at(-1) === undefined ? {} : { latestArtifact: context.artifacts.at(-1) }),
-      priorStepSummaries: context.stepResults.map((result) => ({ role: result.role, summary: result.summary,
-        filesChanged: result.filesChanged, testsRun: result.testsRun })), artifacts: context.artifacts,
-      unresolvedIssues: context.stepResults.flatMap((result) => result.unresolvedIssues ?? []),
+      priorStepSummaries: history.summaries, artifacts: context.artifacts,
+      ...(history.omittedStepCount === 0 ? {} : { omittedStepCount: history.omittedStepCount }),
+      unresolvedIssues: dedupe(context.stepResults.flatMap((result) => result.unresolvedIssues ?? [])),
       reviewIteration: Object.values(context.loopState)[0]?.iteration ?? 0, allowedActions: node.allowedActions });
     const decision = routerOrchestrationDecisionSchema.parse(await this.router.decideNext(checkpoint));
     if (!node.allowedActions.includes(decision.action)) throw new AgentError("ROUTER_INVALID_OUTPUT",
@@ -185,18 +196,34 @@ export class WorkflowEngine {
     const missing = required.filter((node) => !context.completedNodeIds.includes(node.id));
     if (missing.length > 0) throw new AgentError("ROUTER_INVALID_OUTPUT", `Completion is blocked by: ${missing.map((node) => node.label).join(", ")}`);
   }
-  private handoff(context: WorkflowContext, node: WorkflowNode): WorkflowHandoffPacket {
+  private handoff(context: WorkflowContext, node: WorkflowNode, retainedProviderSessionId?: string): WorkflowHandoffPacket {
     const latestReview = [...context.stepResults].reverse().find((result) => result.reviewVerdict !== undefined);
+    // Steps that already ran inside the provider session about to be resumed are in that provider's own transcript.
+    // Re-sending them would pay for the same history twice, so only the work of other agents is carried.
+    const carried = retainedProviderSessionId === undefined ? context.stepResults
+      : context.stepResults.filter((result) => result.providerSessionId !== retainedProviderSessionId);
+    const history = compactHistory(carried, this.compaction);
+    const prd = context.artifacts.find((artifact) => artifact.kind === "prd");
+    // A reviewer has to judge the exact change and cannot re-derive it once later steps move the tree; every other
+    // role is already in the workspace, so it gets the changed paths and reads them itself.
+    const diff = node.type === "review_gate" ? compactDiff(this.latestDiff(context), this.compaction) : undefined;
     return { originalTask: context.originalUserTask, currentGoal: node.label,
       ...(context.routingDecision === undefined ? {} : { routingDecision: context.routingDecision }),
-      ...(context.artifacts.find((artifact) => artifact.kind === "prd") === undefined ? {}
-        : { prd: context.artifacts.find((artifact) => artifact.kind === "prd") }),
-      priorStepSummaries: context.stepResults.map((result) => ({ role: result.role, summary: result.summary,
-        filesChanged: result.filesChanged, testsRun: result.testsRun })),
-      // Without the diff a reviewer only sees file names, so the newest one is carried forward.
-      ...(this.latestDiff(context) === undefined ? {} : { currentDiff: this.latestDiff(context) }),
+      ...(prd === undefined ? {} : { prd }),
+      priorStepSummaries: history.summaries,
+      ...(history.changedFiles.length === 0 ? {} : { changedFiles: history.changedFiles }),
+      ...(history.omittedStepCount === 0 ? {} : { omittedStepCount: history.omittedStepCount }),
+      ...(diff === undefined ? {} : { currentDiff: diff }),
       ...(latestReview?.findings === undefined ? {} : { reviewFindings: latestReview.findings }),
-      unresolvedIssues: context.stepResults.flatMap((result) => result.unresolvedIssues ?? []) };
+      ...(retainedProviderSessionId === undefined ? {} : { providerSessionRetained: true }),
+      // Sent whole and unabridged even on a retained session: it is the record compaction is not allowed to erode.
+      ...(this.hasSharedState(context) ? { sharedState: context.sharedState } : {}),
+      // Blockers stay whole even on a retained session: they are small, and they are the one thing a step must act on.
+      unresolvedIssues: dedupe(context.stepResults.flatMap((result) => result.unresolvedIssues ?? [])) };
+  }
+  private hasSharedState(context: WorkflowContext): boolean {
+    const { planItems, decisions, openQuestions } = context.sharedState;
+    return planItems.length + decisions.length + openQuestions.length > 0;
   }
   private latestDiff(context: WorkflowContext): string | undefined {
     return [...context.stepResults].reverse().find((result) => result.diff !== undefined)?.diff;
@@ -209,10 +236,13 @@ export class WorkflowEngine {
   private fixPacket(context: WorkflowContext) {
     const implementation = [...context.stepResults].reverse().find((result) => ["low", "medium", "high"].includes(result.role));
     const review = [...context.stepResults].reverse().find((result) => result.reviewVerdict === "fail");
-    return { originalTask: context.originalUserTask, implementationSummary: implementation?.summary ?? "",
+    return { originalTask: context.originalUserTask,
+      implementationSummary: clip(implementation?.summary ?? "", this.compaction.summaryChars),
       reviewIteration: (Object.values(context.loopState)[0]?.iteration ?? 0) + 1, findings: review?.findings ?? [],
-      currentChangedFiles: [...new Set(context.stepResults.flatMap((result) => result.filesChanged))],
-      testsAlreadyRun: context.stepResults.flatMap((result) => result.testsRun),
+      currentChangedFiles: dedupe(context.stepResults.flatMap((result) => result.filesChanged))
+        .slice(-this.compaction.maxChangedFiles),
+      // A review/fix loop reruns the same suite each pass, so only the latest outcome per command is informative.
+      testsAlreadyRun: latestTestPerCommand(context.stepResults.flatMap((result) => result.testsRun)),
       ...(context.artifacts.find((artifact) => artifact.kind === "prd") === undefined ? {}
         : { prdArtifact: context.artifacts.find((artifact) => artifact.kind === "prd") }) };
   }
@@ -223,8 +253,11 @@ export class WorkflowEngine {
     return { operation: requested?.operation ?? node.operation, kind: requested?.kind ?? node.documentKind,
       ...(targetPath === undefined ? {} : { targetPath }),
       originalTask: context.originalUserTask, ...(context.routingDecision === undefined ? {} : { routingDecision: context.routingDecision }),
-      // A copy, so the document step sees the work that preceded it and never its own recorded result.
-      stepResults: [...context.stepResults], ...(this.latestReview(context) === undefined ? {} : { finalReview: this.latestReview(context) }) };
+      // A copy, so the document step sees the work that preceded it and never its own recorded result. A writer
+      // describes what changed rather than reproducing it, so the diffs are stripped and the summaries clipped —
+      // this was by far the largest packet in a run, carrying every diff the workflow had ever produced.
+      stepResults: context.stepResults.slice(-this.compaction.maxSteps).map((result) => withoutDiff(result, this.compaction)),
+      ...(this.latestReview(context) === undefined ? {} : { finalReview: this.latestReview(context) }) };
   }
   private node(definition: WorkflowDefinition, id: string): WorkflowNode {
     const node = definition.nodes.find((candidate) => candidate.id === id);

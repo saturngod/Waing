@@ -73,6 +73,24 @@ export type TestRecord = z.infer<typeof testRecordSchema>;
 export const workflowArtifactRefSchema = z.object({ id: z.string().min(1), kind: z.string().min(1), path: z.string().min(1),
   createdByStepRunId: z.string().min(1) }).strict();
 export type WorkflowArtifactRef = z.infer<typeof workflowArtifactRefSchema>;
+
+/**
+ * The durable spine of a run. Prose summaries are compacted away as a workflow grows, so anything a later step must
+ * still be able to act on — the plan, the decisions already made, the questions still open — lives here instead: small,
+ * structured, addressable by id, and never pruned. Steps amend it rather than restating it in their final message.
+ */
+export const planItemSchema = z.object({ id: z.string().min(1).max(64), title: z.string().min(1).max(200),
+  status: z.enum(["pending", "in_progress", "done", "dropped"]) }).strict();
+export type PlanItem = z.infer<typeof planItemSchema>;
+export const workflowSharedStateSchema = z.object({ planItems: z.array(planItemSchema).default([]),
+  decisions: z.array(z.string().min(1).max(300)).default([]),
+  openQuestions: z.array(z.string().min(1).max(300)).default([]) }).strict();
+export type WorkflowSharedState = z.infer<typeof workflowSharedStateSchema>;
+/** What a single step may amend. Omitted keys leave that part of the state untouched. */
+export const workflowSharedStateUpdateSchema = z.object({ planItems: z.array(planItemSchema).optional(),
+  decisions: z.array(z.string().min(1).max(300)).optional(),
+  openQuestions: z.array(z.string().min(1).max(300)).optional() }).strict();
+export type WorkflowSharedStateUpdate = z.infer<typeof workflowSharedStateUpdateSchema>;
 export const reviewFindingSchema = z.object({ id: z.string().min(1), severity: z.enum(["critical", "high", "medium", "low", "info"]),
   category: z.enum(["correctness", "security", "regression", "performance", "maintainability", "testing", "documentation"]),
   title: z.string().min(1), description: z.string().min(1), file: z.string().optional(), line: z.number().int().positive().optional(),
@@ -89,6 +107,10 @@ export const workflowStepResultSchema = z.object({ stepRunId: z.string().min(1),
   role: workflowRoleSchema, agentId: z.string().min(1), modelId: z.string().optional(), effort: z.string().optional(),
   status: z.enum(["completed", "failed", "cancelled"]), summary: z.string(), filesRead: z.array(z.string()),
   filesChanged: z.array(z.string()), diff: z.string().optional(),
+  /** The provider-side session this step ran in, so a later step on the same agent can resume instead of restarting. */
+  providerSessionId: z.string().min(1).optional(),
+  /** The step's amendment to the run's shared state, parsed out of its final message. */
+  stateUpdate: workflowSharedStateUpdateSchema.optional(),
   commandsRun: z.array(commandRecordSchema), testsRun: z.array(testRecordSchema),
   artifacts: z.array(workflowArtifactRefSchema), findings: z.array(reviewFindingSchema).optional(),
   reviewVerdict: z.enum(["pass", "fail"]).optional(), unresolvedIssues: z.array(z.string()).optional() }).strict();
@@ -104,11 +126,24 @@ export const reviewFixLoopPolicySchema = z.object({ maxReviewAttempts: z.number(
   blockingSeverities: z.array(z.enum(["critical", "high", "medium", "low"])) }).strict();
 export type ReviewFixLoopPolicy = z.infer<typeof reviewFixLoopPolicySchema>;
 
+export const stepSummaryEntrySchema = z.object({ role: workflowRoleSchema, summary: z.string(),
+  filesChanged: z.array(z.string()), testsRun: z.array(testRecordSchema),
+  /** Set when the compactor collapsed this step to a headline; the full text stays in the stored context. */
+  collapsed: z.boolean().optional() }).strict();
+export type StepSummaryEntry = z.infer<typeof stepSummaryEntrySchema>;
+
 export const workflowHandoffPacketSchema = z.object({ originalTask: z.string(), currentGoal: z.string(),
   routingDecision: routingDecisionSchema.optional(), prd: workflowArtifactRefSchema.optional(),
-  priorStepSummaries: z.array(z.object({ role: workflowRoleSchema, summary: z.string(), filesChanged: z.array(z.string()),
-    testsRun: z.array(testRecordSchema) }).strict()), currentDiff: z.string().optional(),
-  reviewFindings: z.array(reviewFindingSchema).optional(), unresolvedIssues: z.array(z.string()) }).strict();
+  priorStepSummaries: z.array(stepSummaryEntrySchema), currentDiff: z.string().optional(),
+  reviewFindings: z.array(reviewFindingSchema).optional(), unresolvedIssues: z.array(z.string()),
+  /** Deduplicated across every prior step so a path is never repeated per entry; the agent re-reads them from disk. */
+  changedFiles: z.array(z.string()).optional(),
+  /** How many older steps the compactor dropped entirely, so the receiver knows the history is partial. */
+  omittedStepCount: z.number().int().min(0).optional(),
+  /** True when the provider session already holds the prior turns, so the packet only carries what is new. */
+  providerSessionRetained: z.boolean().optional(),
+  /** Survives compaction and session changes intact; the one part of the handoff that is never summarised away. */
+  sharedState: workflowSharedStateSchema.optional() }).strict();
 export type WorkflowHandoffPacket = z.infer<typeof workflowHandoffPacketSchema>;
 
 export const stepActivityKindSchema = z.enum(["routing", "creating_prd", "updating_prd", "implementing", "planning",
@@ -126,9 +161,9 @@ export type StepAnnouncement = z.infer<typeof stepAnnouncementSchema>;
 
 export const routerCheckpointInputSchema = z.object({ checkpointReason: routerCheckpointReasonSchema,
   originalUserTask: z.string(), latestStepResult: workflowStepResultSchema.optional(), latestReview: reviewResultSchema.optional(),
-  latestArtifact: workflowArtifactRefSchema.optional(), priorStepSummaries: z.array(z.object({ role: workflowRoleSchema,
-    summary: z.string(), filesChanged: z.array(z.string()), testsRun: z.array(testRecordSchema) }).strict()),
+  latestArtifact: workflowArtifactRefSchema.optional(), priorStepSummaries: z.array(stepSummaryEntrySchema),
   artifacts: z.array(workflowArtifactRefSchema), unresolvedIssues: z.array(z.string()), reviewIteration: z.number().int().min(0).optional(),
+  omittedStepCount: z.number().int().min(0).optional(),
   allowedActions: z.array(workflowNextActionKindSchema).min(1) }).strict();
 export type RouterCheckpointInput = z.infer<typeof routerCheckpointInputSchema>;
 export const routerOrchestrationDecisionSchema = z.object({ action: workflowNextActionKindSchema,
@@ -153,7 +188,10 @@ export const workflowContextSchema = z.object({ workflowRunId: z.string(), proje
   routerDecisionCount: z.number().int().min(0), routerDecisionHistory: z.array(routerDecisionRecordSchema),
   latestRouterDecision: routerOrchestrationDecisionSchema.optional(), activeNodeId: z.string(),
   completedNodeIds: z.array(z.string()), stepResults: z.array(workflowStepResultSchema), artifacts: z.array(workflowArtifactRefSchema),
-  loopState: z.record(z.string(), z.object({ iteration: z.number().int().min(0), maxIterations: z.number().int().positive() }).strict()) }).strict();
+  loopState: z.record(z.string(), z.object({ iteration: z.number().int().min(0), maxIterations: z.number().int().positive() }).strict()),
+  /** agentId → provider session id, so consecutive steps on one agent reuse the transcript the provider already holds. */
+  providerSessions: z.record(z.string(), z.string()).default({}),
+  sharedState: workflowSharedStateSchema.default({ planItems: [], decisions: [], openQuestions: [] }) }).strict();
 export type WorkflowContext = z.infer<typeof workflowContextSchema>;
 
 export const workflowRunStatusSchema = z.enum(["created", "validating", "ready", "running_node", "waiting_permission",

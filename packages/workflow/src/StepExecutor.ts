@@ -1,10 +1,16 @@
 import { randomUUID } from "node:crypto";
 import type { AgentManager } from "@waing/agent-core";
-import { AgentError, reviewResultSchema, workflowHandoffPacketSchema, workflowStepResultSchema } from "@waing/domain";
-import type {
-  AgentEvent, AgentRequest, DocumentTaskInput, FixPacket, RoleExecutionProfile, StepAnnouncementIntent, WorkflowContext,
-  WorkflowHandoffPacket, WorkflowNode, WorkflowStepResult,
+import {
+  AgentError, reviewResultSchema, workflowHandoffPacketSchema, workflowSharedStateUpdateSchema, workflowStepResultSchema,
 } from "@waing/domain";
+import type {
+  AgentEvent, AgentRequest, AgentSession, DocumentTaskInput, FixPacket, RoleExecutionProfile, StepAnnouncementIntent, WorkflowContext,
+  WorkflowHandoffPacket, WorkflowNode, WorkflowSharedStateUpdate, WorkflowStepResult,
+} from "@waing/domain";
+import { renderPacket } from "./ContextCompactor";
+
+/** Fence label an agent wraps its shared-state amendment in, so it is separable from its prose. */
+const STATE_FENCE = "waing-state";
 
 export interface ResolvedProfileDisplay { agentDisplayName: string; modelDisplayName?: string }
 export interface StepExecutionInput {
@@ -16,6 +22,9 @@ export interface StepExecutionInput {
   fixPacket?: FixPacket;
   documentInput?: DocumentTaskInput;
   intent?: StepAnnouncementIntent;
+  /** A provider session an earlier step on this same agent left behind; resumed when the provider can, so the prior
+   * turns never have to be re-sent through the packet. */
+  resumeProviderSessionId?: string;
   signal: AbortSignal;
 }
 export interface WorkflowStepExecutor {
@@ -41,8 +50,7 @@ export class AgentStepExecutor implements WorkflowStepExecutor {
   async execute(input: StepExecutionInput): Promise<WorkflowStepResult> {
     workflowHandoffPacketSchema.parse(input.handoff);
     if (input.signal.aborted) throw new AgentError("CANCELLED", "Workflow step cancelled");
-    const session = await this.agents.startSession(input.profile.agentId, { conversationId: input.context.workflowRunId,
-      projectId: input.context.projectId, projectRoot: input.context.projectRoot });
+    const session = await this.openSession(input);
     this.activeSessionId = session.id;
     const events: AgentEvent[] = [];
     let settle: ((event: AgentEvent) => void) | undefined;
@@ -61,13 +69,34 @@ export class AgentStepExecutor implements WorkflowStepExecutor {
       const terminalEvent = await Promise.race([terminal, new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => reject(new AgentError("TIMEOUT", `Workflow step ${input.node.id} timed out`, input.profile.agentId, true)), timeoutMs);
       })]).finally(() => { if (timer !== undefined) clearTimeout(timer); });
-      return this.result(input, events, terminalEvent);
+      return this.result(input, events, terminalEvent, session);
     } finally {
       input.signal.removeEventListener("abort", onAbort); unsubscribe(); delete this.activeSessionId;
     }
   }
 
   async cancel(): Promise<void> { if (this.activeSessionId !== undefined) await this.agents.cancel(this.activeSessionId); }
+
+  /**
+   * Consecutive steps on one agent are the cheapest context handoff there is: the provider still holds the earlier
+   * turns, so resuming costs nothing where re-sending them costs the whole history again. Providers without
+   * persistent sessions, and sessions the provider has since dropped, fall back to a fresh session plus the full
+   * packet — the workflow context stays provider-neutral either way.
+   */
+  private async openSession(input: StepExecutionInput): Promise<AgentSession> {
+    const start = { conversationId: input.context.workflowRunId, projectId: input.context.projectId,
+      projectRoot: input.context.projectRoot };
+    if (input.resumeProviderSessionId !== undefined) {
+      const { capabilities } = await this.agents.registry.get(input.profile.agentId).discover();
+      if (capabilities.persistentSessions) {
+        try {
+          return await this.agents.resumeSession(input.profile.agentId,
+            { ...start, providerSessionId: input.resumeProviderSessionId });
+        } catch { /* The provider forgot the session; a fresh one with the full packet is still correct. */ }
+      }
+    }
+    return this.agents.startSession(input.profile.agentId, start);
+  }
 
   /**
    * A role profile carries a mode, model, and effort for every role, but providers differ: some CLIs expose no model
@@ -84,19 +113,31 @@ export class AgentStepExecutor implements WorkflowStepExecutor {
     return { mode, ...(model === undefined ? {} : { model }), ...(effort === undefined ? {} : { effort }) };
   }
 
+  /**
+   * Packets are rendered as headed plain text rather than JSON: identical content costs roughly half the tokens once
+   * braces, quotes and repeated keys are gone. Empty fields render to nothing, so a short run sends a short prompt.
+   */
   private prompt(input: StepExecutionInput): string {
     const sections = [input.profile.instructions, "instructions" in input.node ? input.node.instructions : undefined,
-      `Provider-neutral workflow handoff:\n${JSON.stringify(input.handoff)}`].filter((value): value is string => value !== undefined);
+      renderPacket("Provider-neutral workflow handoff", input.handoff)].filter((value): value is string => value !== undefined);
+    if (input.handoff.changedFiles !== undefined && input.handoff.currentDiff === undefined) sections.push(
+      "Read the changed files listed above from the workspace; the diff is not reproduced here.");
+    // Amending the shared state costs a few dozen tokens and spares every later step from re-deriving the plan out of
+    // prose that compaction will eventually throw away.
+    sections.push(`If the plan, a decision, or an open question changed, end with a ${STATE_FENCE} block containing`
+      + ` only {"planItems":[{"id","title","status":pending|in_progress|done|dropped}],"decisions":[],"openQuestions":[]}.`
+      + " Include only the keys that changed, and reuse an existing plan item id to revise it.");
     if (input.node.type === "review_gate") sections.push("Return a final JSON object with verdict, summary, findings, testsObserved, and confidence.");
-    if (input.node.type === "document") sections.push(`Document task input:\n${JSON.stringify(input.documentInput)}`);
+    if (input.node.type === "document") sections.push(renderPacket("Document task input", input.documentInput));
     if (input.node.type === "role_task" && input.node.role === "bugfix") sections.push(
       "Address blocking review finding IDs first; avoid unrelated refactoring; report unresolved findings.",
-      `Fix packet:\n${JSON.stringify(input.fixPacket)}`,
+      renderPacket("Fix packet", input.fixPacket),
     );
-    return sections.join("\n\n");
+    return sections.filter((section) => section.trim().length > 0).join("\n\n");
   }
 
-  private result(input: StepExecutionInput, events: AgentEvent[], terminal: AgentEvent): WorkflowStepResult {
+  private result(input: StepExecutionInput, events: AgentEvent[], terminal: AgentEvent,
+    session: AgentSession): WorkflowStepResult {
     const messages = events.filter((event) => event.type === "message.delta" || event.type === "message.completed")
       .map((event) => event.text).join("");
     const commands: Array<{ command: string[]; exitCode: number | null }> = events
@@ -107,15 +148,20 @@ export class AgentStepExecutor implements WorkflowStepExecutor {
     // The newest diff is what a later reviewer or doc writer has to work from, so it travels with the result.
     const diff = [...events].reverse().find((event) => event.type === "diff.updated")?.diff;
     const filesRead = [...new Set(events.filter((event) => event.type === "file.read").map((event) => event.path))];
-    const review = input.node.type === "review_gate" ? this.parseReview(messages) : undefined;
+    // Stripped before anything else reads the message: the review gate scans for a bare JSON object and would
+    // otherwise swallow the state block, and the stored summary should not repeat what the state already holds.
+    const { text, update } = this.parseStateUpdate(messages);
+    const review = input.node.type === "review_gate" ? this.parseReview(text) : undefined;
     const artifacts = input.node.type === "document" && input.node.path !== undefined ? [{ id: randomUUID(), kind: input.node.documentKind,
       path: input.node.path, createdByStepRunId: input.stepRunId }] : [];
     return workflowStepResultSchema.parse({ stepRunId: input.stepRunId, nodeId: input.node.id, role: input.node.role,
-      agentId: input.profile.agentId, ...(input.profile.modelId === undefined ? {} : { modelId: input.profile.modelId }),
+      agentId: input.profile.agentId, ...(session.providerSessionId === undefined ? {} : { providerSessionId: session.providerSessionId }),
+      ...(input.profile.modelId === undefined ? {} : { modelId: input.profile.modelId }),
       ...(input.profile.effort === undefined ? {} : { effort: input.profile.effort }),
       status: terminal.type === "run.completed" ? "completed"
         : terminal.type === "run.failed" && terminal.code === "CANCELLED" ? "cancelled" : "failed",
-      summary: messages || (terminal.type === "run.failed" ? terminal.message : `${input.node.label} completed`),
+      summary: text || (terminal.type === "run.failed" ? terminal.message : `${input.node.label} completed`),
+      ...(update === undefined ? {} : { stateUpdate: update }),
       filesRead, filesChanged, ...(diff === undefined ? {} : { diff }), commandsRun: commands,
       testsRun: commands.filter((command) => command.command.some((part) => /test/u.test(part))).map((command) => ({
         command: command.command.join(" "), passed: command.exitCode === 0, exitCode: command.exitCode,
@@ -123,6 +169,22 @@ export class AgentStepExecutor implements WorkflowStepExecutor {
       ...(review === undefined ? {} : { findings: review.findings, reviewVerdict: review.verdict,
         unresolvedIssues: review.findings.filter((finding) => finding.severity === "critical" || finding.severity === "high").map((finding) => finding.title) }),
     });
+  }
+
+  /**
+   * The state block is advisory: a provider that ignores it, or emits something malformed, must not fail the step.
+   * Only a well-formed block is taken, and it is always removed from the text the rest of the pipeline sees.
+   */
+  private parseStateUpdate(text: string): { text: string; update?: WorkflowSharedStateUpdate } {
+    const pattern = new RegExp(`\`\`\`${STATE_FENCE}\\s*([\\s\\S]*?)\`\`\``, "gu");
+    const matches = [...text.matchAll(pattern)];
+    if (matches.length === 0) return { text };
+    const stripped = text.replace(pattern, "").trim();
+    const parsed = workflowSharedStateUpdateSchema.safeParse(this.json(matches.at(-1)?.[1] ?? ""));
+    return parsed.success ? { text: stripped, update: parsed.data } : { text: stripped };
+  }
+  private json(value: string): unknown {
+    try { return JSON.parse(value) as unknown; } catch { return undefined; }
   }
 
   private parseReview(text: string) {

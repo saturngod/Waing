@@ -1,4 +1,5 @@
 export * from "./AnnouncementRenderer";
+export * from "./ContextCompactor";
 export * from "./ContextStore";
 export * from "./ProfileResolver";
 export * from "./RoleProfileDefaults";

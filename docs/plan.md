@@ -2582,10 +2582,27 @@ export interface WorkflowContext {
     iteration: number;
     maxIterations: number;
   }>;
+
+  // agentId → provider session id, so a later step on the same agent resumes instead of restarting.
+  providerSessions: Record<string, string>;
+
+  // Small, structured, and exempt from compaction — the part of the run that must survive every handoff.
+  sharedState: WorkflowSharedState;
+}
+
+export interface WorkflowSharedState {
+  planItems: Array<{ id: string; title: string; status: "pending" | "in_progress" | "done" | "dropped" }>;
+  decisions: string[];
+  openQuestions: string[];
 }
 ```
 
 Provider sessions can be reused within a role when safe, but the workflow context is provider-neutral.
+
+A step amends `sharedState` by ending its final message with a ```` ```waing-state ```` block holding only the keys it
+changed; plan items are addressed by id so a revision replaces rather than appends. The block is advisory — a provider
+that omits it, or emits something malformed, never fails the step — and it is always stripped before the message is
+stored or handed to the review parser.
 
 ## 19.20 Cross-agent handoff context
 
@@ -2610,10 +2627,37 @@ export interface WorkflowHandoffPacket {
   currentDiff?: string;
   reviewFindings?: ReviewFinding[];
   unresolvedIssues: string[];
+
+  changedFiles?: string[];
+  omittedStepCount?: number;
+  providerSessionRetained?: boolean;
+  sharedState?: WorkflowSharedState;
 }
 ```
 
 Do not send hidden reasoning or undocumented provider internals.
+
+### Compaction
+
+A step summary is the executing agent's entire final message, so forwarding every one of them verbatim makes each step
+cost more than the last. Packets are therefore compacted on the way into a prompt — the stored context is never
+compacted, so the timeline and replay keep the full text:
+
+- **Protected tail.** The newest steps keep their summary; older ones collapse to a headline, and steps beyond the
+  budget are dropped and counted in `omittedStepCount`.
+- **Disk over transcript.** `currentDiff` goes only to a review gate, which must judge the exact change. Every other
+  role gets the deduplicated `changedFiles` and re-reads them from the workspace it is already sitting in.
+- **Noise removal.** Passing tests drop off collapsed steps, a rerun suite keeps only its latest outcome per command,
+  and repeated blockers and file paths are deduplicated across the run.
+- **Retained sessions.** When the next step resumes a provider session, the steps that already ran inside that session
+  are omitted from the packet — the provider still holds them — and `providerSessionRetained` says so. Providers
+  without persistent sessions, and sessions the provider has since dropped, fall back to a fresh session and the full
+  packet.
+- **Never compacted.** `sharedState` and `unresolvedIssues` travel whole, always. They are what a later step must act
+  on, and they are small enough to afford.
+
+Packets are rendered as headed plain text rather than JSON; identical content costs roughly half the tokens once
+braces, quotes, and repeated keys are gone, and empty fields render to nothing.
 
 ## 19.21 Workflow run state machine
 
