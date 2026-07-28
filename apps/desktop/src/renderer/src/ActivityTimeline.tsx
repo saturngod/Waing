@@ -1,3 +1,4 @@
+import { Check, ChevronDown, Dot, X } from "lucide-react";
 import type { AgentEvent } from "@waing/domain";
 import { Markdown } from "./Markdown";
 
@@ -121,13 +122,14 @@ export function ActivityTimeline({ events, prompt, steps = [], model, effort, ag
       </article>;
     }
     return <details className={`activity-group ${item.pending ? "pending" : "done"}`} key={item.id}>
-      <summary><span className="activity-spinner" aria-hidden="true" /><span>{activitySummary(item)}</span><span className="activity-chevron">⌄</span></summary>
+      <summary><span className="activity-spinner" aria-hidden="true" /><span>{activitySummary(item)}</span><ChevronDown className="activity-chevron" size={16} /></summary>
       <div className="activity-group-items">{item.entries.map((entry) => {
         if (entry.kind === "output") return <pre className="activity-output" key={entry.id}>{entry.text}</pre>;
         const content = activityText(entry.event);
         const state = entry.event.type.includes("failed") ? "failed" : entry.event.type.includes("completed") ? "done" : "";
         return <div className={`chat-activity ${state}`} key={entry.id}>
-          <span className="chat-dot">{state === "failed" ? "!" : state === "done" ? "✓" : "·"}</span>
+          <span className="chat-dot">{state === "failed" ? <X size={9} strokeWidth={3.5} />
+            : state === "done" ? <Check size={9} strokeWidth={3.5} /> : <Dot size={9} strokeWidth={3.5} />}</span>
           <span className="chat-activity-title">{content.title}</span>
           {content.detail !== undefined && <span className="chat-activity-detail">{content.detail}</span>}
           {entry.repeats > 1 && <span className="chat-activity-count">×{entry.repeats}</span>}
@@ -146,7 +148,8 @@ export function ActivityTimeline({ events, prompt, steps = [], model, effort, ag
     {items.filter((item) => item.kind === "user").map(renderItem)}
     {/* Routing runs before the provider starts, so its steps sit between the prompt and the first provider event. */}
     {steps.map((step) => <div className={`chat-activity ${step.state ?? ""}`} key={step.id}>
-      <span className="chat-dot">{step.state === "failed" ? "!" : step.state === "done" ? "✓" : ""}</span>
+      <span className="chat-dot">{step.state === "failed" ? <X size={9} strokeWidth={3.5} />
+        : step.state === "done" ? <Check size={9} strokeWidth={3.5} /> : null}</span>
       <span className="chat-activity-title">{step.title}</span>
       {step.detail !== undefined && <span className="chat-activity-detail">{step.detail}</span>}
     </div>)}

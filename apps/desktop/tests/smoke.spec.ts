@@ -80,12 +80,11 @@ test("launches a sandboxed renderer with the typed preload bridge", async () => 
     // The fake agent echoes the prompt, so this exercises Markdown rendering and raw-HTML escaping in one run.
     await page.getByLabel("Message").fill('Add a searchable project dashboard <img src=x onerror="window.__waingXss=true">\n\n'
       + "| Case | Result |\n|---|---|\n| Saved | `./images/hello.png` |\n\n- **bold** item");
-    await page.getByRole("button", { name: "Preview route" }).click();
-    const routingCard = page.getByRole("region", { name: "Routing decision" });
-    await expect(routingCard).toBeVisible();
-    await expect(routingCard).toContainText("Medium Level Task");
-    await expect(routingCard).toContainText("92%");
-    await page.getByRole("button", { name: "Send ↵" }).click();
+    await page.getByRole("button", { name: "Send" }).click();
+    // The routing decision is reported by the run itself, so the timeline is where it has to show up.
+    const routedStep = page.locator(".chat-activity", { hasText: "Routed to medium" });
+    await expect(routedStep).toBeVisible();
+    await expect(routedStep).toContainText("92%");
     await expect(page.getByRole("region", { name: "Permission request" })).toBeVisible();
     await expect(page.getByTestId("last-event")).toBeHidden();
     await expect(page.getByRole("button", { name: "Deny" })).toBeVisible();
@@ -131,7 +130,7 @@ test("launches a sandboxed renderer with the typed preload bridge", async () => 
     await expect(page.getByRole("region", { name: "Conversation" })).toContainText("Add a searchable project dashboard");
     // Sending from an open history item continues that app conversation instead of adding another sidebar row.
     await page.getByLabel("Message").fill("Continue from that plan");
-    await page.getByRole("button", { name: "Send ↵" }).click();
+    await page.getByRole("button", { name: "Send" }).click();
     await expect(page.locator(".conversation-list button")).toHaveCount(1);
     await expect(page.getByRole("region", { name: "Permission request" })).toBeVisible();
     await page.getByRole("button", { name: "Allow once" }).click();

@@ -1,16 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Activity, ArrowLeft, Search, Server, Settings2, Workflow } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import type { AgentDescriptor, RoleExecutionProfile } from "@waing/domain";
 import { RoleProfileGrid } from "./RoleProfileGrid";
 import { PROVIDER_STATUS_HINT, providerDotState, providerStatusLabel } from "./providerStatus";
 
-type SettingsSection = "general" | "routing" | "providers" | "permissions" | "diagnostics";
+type SettingsSection = "general" | "routing" | "providers" | "diagnostics";
 
-const SETTINGS_SECTIONS: Array<{ id: SettingsSection; label: string; icon: string; keywords: string }> = [
-  { id: "general", label: "General", icon: "⚙", keywords: "theme appearance updates" },
-  { id: "routing", label: "Roles & routing", icon: "⌘", keywords: "agents models effort mode workflow auto" },
-  { id: "providers", label: "Providers", icon: "◉", keywords: "codex claude opencode antigravity status health" },
-  { id: "permissions", label: "Permissions", icon: "◇", keywords: "access approvals remembered safety" },
-  { id: "diagnostics", label: "Diagnostics", icon: "◌", keywords: "events logs protocol export" },
+const SETTINGS_SECTIONS: Array<{ id: SettingsSection; label: string; icon: LucideIcon; keywords: string }> = [
+  { id: "general", label: "General", icon: Settings2, keywords: "theme appearance updates" },
+  // Permissions are set per role here, so a search for them lands on this page rather than a screen of its own.
+  { id: "routing", label: "Roles & routing", icon: Workflow, keywords: "agents models effort mode workflow auto permissions access approvals" },
+  { id: "providers", label: "Providers", icon: Server, keywords: "codex claude opencode antigravity status health" },
+  { id: "diagnostics", label: "Diagnostics", icon: Activity, keywords: "events logs export troubleshooting" },
 ];
 
 export function SettingsPanel({ agents, eventCount, theme, onThemeChange, onRolesSaved, onBack }: {
@@ -66,13 +68,13 @@ export function SettingsPanel({ agents, eventCount, theme, onThemeChange, onRole
 
   return <section className="settings-panel" aria-label="Settings">
     <aside className="settings-sidebar">
-      <button className="settings-back" type="button" onClick={onBack}><span>←</span> Back to app</button>
-      <label className="settings-search"><span aria-hidden="true">⌕</span><input type="search" aria-label="Search settings"
+      <button className="settings-back" type="button" onClick={onBack}><ArrowLeft size={16} /> Back to app</button>
+      <label className="settings-search"><Search size={16} aria-hidden="true" /><input type="search" aria-label="Search settings"
         placeholder="Search settings…" value={search} onChange={(event) => setSearch(event.target.value)} /></label>
       <p className="settings-group-label">Waing</p>
       <nav aria-label="Settings categories">{visibleSections.map((item) => <button type="button" key={item.id}
         className={section === item.id && search.length === 0 ? "active" : ""} onClick={() => navigate(item.id)}>
-        <span aria-hidden="true">{item.icon}</span>{item.label}</button>)}</nav>
+        <item.icon size={16} aria-hidden="true" />{item.label}</button>)}</nav>
       {visibleSections.length === 0 && <p className="settings-no-results">No settings found</p>}
     </aside>
     <div className="settings-page">
@@ -86,7 +88,7 @@ export function SettingsPanel({ agents, eventCount, theme, onThemeChange, onRole
             <select defaultValue="manual"><option>manual</option><option>notify</option></select></label>
         </div></div></>}
 
-      {section === "routing" && <><header><p>Settings</p><h2>Roles & routing</h2>
+      {section === "routing" && <><header className="wide"><p>Settings</p><h2>Roles & routing</h2>
         <span>Choose which provider and model handles each kind of work.</span></header>
         <div className="settings-section routing-settings"><div className="settings-section-heading"><h3>Role assignments</h3>
           <span className="settings-save-status" role="status" aria-live="polite">{saving ? "Saving…" : ""}</span></div>
@@ -101,18 +103,9 @@ export function SettingsPanel({ agents, eventCount, theme, onThemeChange, onRole
             <strong>{agent.displayName}</strong><small>{providerStatusLabel(agent)}</small>
             {agent.warnings.map((warning) => <em key={warning}>{warning}</em>)}</div>)}</div></div></>}
 
-      {section === "permissions" && <><header><p>Settings</p><h2>Permissions</h2><span>Control how agents request access to your projects.</span></header>
-        <div className="settings-section"><h3>Remembered access</h3><div className="settings-card settings-rows">
-          <div><span><strong>Default permissions</strong><small>Agents ask before changing files or running commands.</small></span>
-            <b>Ask before changes</b></div>
-          <div><span><strong>Remembered decisions</strong><small>Remove project approvals saved from earlier tasks.</small></span>
-            <button type="button">Clear remembered permissions</button></div>
-        </div></div></>}
-
       {section === "diagnostics" && <><header><p>Settings</p><h2>Diagnostics</h2><span>Inspect and export provider-neutral troubleshooting data.</span></header>
         <div className="settings-section"><h3>Session diagnostics</h3><div className="settings-card settings-rows">
           <div><span><strong>Normalized events</strong><small>Events received during this app session.</small></span><b>{eventCount}</b></div>
-          <div><span><strong>Protocol trace</strong><small>Sensitive provider traffic is not being recorded.</small></span><b>Off</b></div>
           <div><span><strong>Redacted export</strong><small>Create a diagnostics file with known secrets removed.</small></span>
             <button type="button" onClick={() => void exportDiagnostics()}>Export diagnostics</button></div>
         </div>{exportedPath !== undefined && <p className="settings-exported">Saved to {exportedPath}</p>}</div></>}

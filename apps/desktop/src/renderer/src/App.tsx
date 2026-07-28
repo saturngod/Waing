@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { CornerDownLeft, FileText, Folder, FolderOpen, Image, MoreHorizontal, PanelLeft, PanelRight,
+  Paperclip, Plus, Settings, SquarePen, Trash2, X } from "lucide-react";
 import type { AppInfo, AttachmentChoice, ConversationHistory, SessionSendResult } from "@waing/ipc-contracts";
-import type { AgentDescriptor, AgentEvent, AppConversation, AutoSelection, PermissionRequest, Project, StepAnnouncement } from "@waing/domain";
+import type { AgentDescriptor, AgentEvent, AppConversation, PermissionRequest, Project, StepAnnouncement } from "@waing/domain";
 import { ActivityTimeline } from "./ActivityTimeline";
 import type { TimelineStep } from "./ActivityTimeline";
-import { RoutingDecisionCard } from "./RoutingDecisionCard";
 import { SettingsPanel } from "./SettingsPanel";
 import { PROVIDER_DOT_TITLES, providerDotState } from "./providerStatus";
 
@@ -54,8 +55,6 @@ export function App() {
   const [attachments, setAttachments] = useState<AttachmentChoice[]>([]);
   const [attachmentDragActive, setAttachmentDragActive] = useState(false);
   const [prompt, setPrompt] = useState<string>();
-  const [routing, setRouting] = useState<AutoSelection>();
-  const [routingBusy, setRoutingBusy] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState<string>();
   const [resolvedAgentId, setResolvedAgentId] = useState<string>();
   const [resolvedModel, setResolvedModel] = useState<string>();
@@ -326,7 +325,7 @@ export function App() {
       setConfirmingRemoval(undefined); setProjectMenuFor(undefined);
       if (project?.id === projectId) {
         setProject(remaining[0] ?? null);
-        setEvents([]); setRouting(undefined); setPermission(undefined); setPrompt(undefined);
+        setEvents([]); setPermission(undefined); setPrompt(undefined);
         setActiveSessionId(undefined); setResolvedAgentId(undefined);
       }
     } catch (reason) { setConfirmingRemoval(undefined); reportError(reason); }
@@ -341,7 +340,7 @@ export function App() {
 
   function clearTranscript(): void {
     setEvents([]); setPrompt(undefined); setWorkflowSteps([]); setAgentMeta({}); setActiveStep(undefined);
-    setRouting(undefined); setRoutedBy(undefined); setPermission(undefined); setResolvedAgentId(undefined);
+    setRoutedBy(undefined); setPermission(undefined); setResolvedAgentId(undefined);
     setResolvedModel(undefined); setResolvedEffort(undefined); setActiveSessionId(undefined); setOpenConversationId(undefined);
     setHistoryMessages([]);
   }
@@ -376,14 +375,6 @@ export function App() {
     } catch (reason) { reportError(reason); }
   }
 
-  async function previewRoute(): Promise<void> {
-    if (project === null || task.trim().length === 0) return;
-    setError(undefined); setRoutingBusy(true);
-    try { setRouting(await window.waing.router.preview(task.trim(), project.id)); }
-    catch (reason) { reportError(reason); }
-    finally { setRoutingBusy(false); }
-  }
-
   async function sendTask(): Promise<void> {
     if (project === null || (task.trim().length === 0 && attachments.length === 0)) return;
     const text = task.trim().length === 0 ? "Please review the attached files." : task.trim();
@@ -395,7 +386,7 @@ export function App() {
         setHistoryMessages(visibleHistoryMessages(history.messages));
       } catch (reason) { reportError(reason); return; }
     }
-    setError(undefined); setRouting(undefined); setEvents([]); setPermission(undefined);
+    setError(undefined); setEvents([]); setPermission(undefined);
     setRunningProjectIds((current) => new Set(current).add(project.id));
     pendingTaskTitleRef.current.set(project.id,
       conversations.find((conversation) => conversation.id === continuingConversationId)?.title ?? text.slice(0, 80));
@@ -445,12 +436,12 @@ export function App() {
       {view === "chat" && sidebarOpen && <aside className="context-sidebar">
         <div className="sidebar-chrome"><span className="traffic-light-space" aria-hidden="true" />
           <button className="sidebar-toggle" type="button" aria-label="Hide sidebar" title="Hide sidebar"
-            onClick={() => setSidebarOpen(false)}><span className="sidebar-toggle-icon" aria-hidden="true" /></button></div>
+            onClick={() => setSidebarOpen(false)}><PanelLeft size={18} aria-hidden="true" /></button></div>
         <div className="app-title"><h1>Waing</h1><button type="button" aria-label="Open project" title="Open project"
-          onClick={() => void chooseProject()}>＋</button><span data-testid="version">{info === undefined ? "…" : `v${info.version}`}</span></div>
+          onClick={() => void chooseProject()}><Plus size={17} /></button><span data-testid="version">{info === undefined ? "…" : `v${info.version}`}</span></div>
         <button className="new-task-button" type="button" disabled={sendBusy}
           title={sendBusy ? "Stop the running task first" : project === null ? "Choose a project and start a task" : "Start a new task"}
-          onClick={() => void beginNewTask()}><span aria-hidden="true">◇</span> New task</button>
+          onClick={() => void beginNewTask()}><SquarePen size={17} aria-hidden="true" /> New task</button>
         <div className="sidebar-heading"><span>Projects</span></div>
         <div className="project-tree">{projects.length === 0 ?
           <button className="empty-project" type="button" onClick={() => void chooseProject()}>Open your first project</button> :
@@ -464,14 +455,14 @@ export function App() {
                   onClick={() => { setProjectMenuFor(undefined); selectProject(item); }}
                   onContextMenu={(event) => { event.preventDefault(); setMenuFor(undefined); setConfirmingRemoval(undefined);
                     setProjectMenuFor({ id: item.id, x: event.clientX, y: event.clientY }); }}>
-                  <span className="folder-icon" aria-hidden="true" />
+                  <Folder size={16} className="folder-icon" aria-hidden="true" />
                   <strong>{item.name}</strong>
                   {running && <span className={`task-running ${permissionsByProject[item.id] === undefined ? "" : "attention"}`}
                     title={permissionsByProject[item.id] === undefined ? "Task running" : "Permission needed"} />}
                 </button>
                 <button className="project-menu-trigger" type="button" aria-label={`Project actions for ${item.name}`} title="Project actions"
                   onClick={(event) => { const bounds = event.currentTarget.getBoundingClientRect(); setMenuFor(undefined);
-                    setConfirmingRemoval(undefined); setProjectMenuFor({ id: item.id, x: Math.max(8, bounds.right - 190), y: bounds.bottom + 3 }); }}>•••</button>
+                    setConfirmingRemoval(undefined); setProjectMenuFor({ id: item.id, x: Math.max(8, bounds.right - 190), y: bounds.bottom + 3 }); }}><MoreHorizontal size={16} /></button>
               </div>
               {active && <div className="conversation-list">{items.length === 0 ? <p>No tasks yet</p> : items.map((conversation) =>
                 <button type="button" key={conversation.id} className={openConversationId === conversation.id ? "active" : ""}
@@ -497,12 +488,12 @@ export function App() {
                 title={runningProjectIds.has(projectMenuFor.id) ? "Stop this project's running task first" : undefined} onClick={() => {
                 const target = projects.find((item) => item.id === projectMenuFor.id);
                 if (target !== undefined) void beginNewTask(target);
-              }}><span aria-hidden="true">＋</span>New chat</button>
+              }}><Plus size={16} aria-hidden="true" />New chat</button>
               <button type="button" role="menuitem" onClick={() => void revealProject(projectMenuFor.id)}>
-                <span aria-hidden="true">⌕</span>Reveal in Finder</button>
+                <FolderOpen size={16} aria-hidden="true" />Reveal in Finder</button>
               <button type="button" role="menuitem" className="danger" disabled={runningProjectIds.has(projectMenuFor.id)}
                 title={runningProjectIds.has(projectMenuFor.id) ? "Stop the running task first" : undefined}
-                onClick={() => setConfirmingRemoval(projectMenuFor.id)}><span aria-hidden="true">×</span>Remove</button>
+                onClick={() => setConfirmingRemoval(projectMenuFor.id)}><Trash2 size={16} aria-hidden="true" />Remove</button>
             </>}
           </div>
         </>}
@@ -514,14 +505,14 @@ export function App() {
           </div>
         </>}
         <div className="sidebar-footer"><button type="button" aria-label="Settings" onClick={() => setView("settings")}>
-          <span aria-hidden="true">⚙</span> Settings</button></div>
+          <Settings size={18} aria-hidden="true" /> Settings</button></div>
       </aside>}
       <section className="workspace">
         <header className="topbar">
           {view === "chat"
             ? <div className="topbar-leading">{!sidebarOpen && <button className="sidebar-toggle reveal" type="button"
                 aria-label="Show sidebar" title="Show sidebar" onClick={() => setSidebarOpen(true)}>
-                <span className="sidebar-toggle-icon" aria-hidden="true" /></button>}
+                <PanelLeft size={18} aria-hidden="true" /></button>}
               <div><p className="eyebrow">Agent workspace</p><h2>{project?.name ?? "No project selected"}</h2></div></div>
             : <div><p className="eyebrow">Applies to every project</p><h2>Settings</h2></div>}
           {/* No per-send agent/model/mode pickers: routing always decides, and Settings owns each role's provider. */}
@@ -543,14 +534,14 @@ export function App() {
             title={rightSidebarOpen ? "Hide right sidebar" : "Show right sidebar"}
             aria-expanded={rightSidebarOpen} aria-controls="run-inspector"
             onClick={() => setRightSidebarOpen((open) => !open)}>
-            <span className="sidebar-toggle-icon right" aria-hidden="true" />
+            <PanelRight size={18} aria-hidden="true" />
           </button>}
         </header>
         {routingNeedsReview && <div className="routing-banner" role="status">
           <span>Auto routing is using defaults built from your installed providers.</span>
           <button type="button" onClick={() => { setView("settings"); }}>Review setup</button>
           <button className="dismiss" type="button" aria-label="Dismiss routing setup notice"
-            onClick={() => { setRoutingNeedsReview(false); void window.waing.settings.acknowledgeRouting().catch(reportError); }}>✕</button>
+            onClick={() => { setRoutingNeedsReview(false); void window.waing.settings.acknowledgeRouting().catch(reportError); }}><X size={15} /></button>
         </div>}
         <div className="content-scroll" ref={scrollRef} onScroll={(event) => {
           const node = event.currentTarget;
@@ -563,7 +554,6 @@ export function App() {
               {...(project === null ? {} : { projectId: project.id })} {...(prompt === undefined ? {} : { prompt })}
               {...(replayText === undefined || replayText.length === 0 ? {} : { replayText })}
               {...(modelLabel === undefined ? {} : { model: modelLabel })} {...(effortLabel === undefined ? {} : { effort: effortLabel })} />
-              {routing !== undefined && <RoutingDecisionCard selection={routing} />}
               {permission !== undefined && <section className={`permission-card ${permission.risk}`} aria-label="Permission request">
                 <div className="permission-heading"><span className={`risk ${permission.risk}`}>{permission.risk} risk</span><span>{permission.agentId}</span></div>
                 <h3>{permission.title}</h3><p>{permission.detail}</p>
@@ -586,19 +576,19 @@ export function App() {
             onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setAttachmentDragActive(false); }}
             onDrop={(event) => { event.preventDefault(); setAttachmentDragActive(false); void addAttachmentFiles([...event.dataTransfer.files]); }}>
             {attachments.length > 0 && <ul className="composer-attachments" aria-label="Attached files">
-            {attachments.map((attachment) => <li key={attachment.id}><span aria-hidden="true">{attachment.kind === "image" ? "▧" : "▤"}</span>
+            {attachments.map((attachment) => <li key={attachment.id}>{attachment.kind === "image"
+              ? <Image size={15} aria-hidden="true" /> : <FileText size={15} aria-hidden="true" />}
               <span title={attachment.name}>{attachment.name}</span><button type="button" aria-label={`Remove ${attachment.name}`}
-                onClick={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))}>×</button></li>)}</ul>}
+                onClick={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))}><X size={14} /></button></li>)}</ul>}
             <textarea ref={composerRef} aria-label="Message" value={task} onChange={(event) => setTask(event.target.value)}
             placeholder="Ask an agent to inspect, explain, or change this project…" rows={3}
             onPaste={(event) => { const files = [...event.clipboardData.files]; if (files.length > 0) { event.preventDefault(); void addAttachmentFiles(files); } }}
             onKeyDown={(event) => { if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) void sendTask(); }} />
             <div><div className="composer-context"><button className="attach-button" type="button" aria-label="Attach files and images"
-              title="Attach files and images" onClick={() => void chooseAttachments()}>＋</button>
+              title="Attach files and images" onClick={() => void chooseAttachments()}><Paperclip size={16} /></button>
               <span>{project?.root ?? "Choose a project to begin"}</span></div><div className="composer-actions">
-              <button type="button" disabled={routingBusy || project === null || task.trim().length === 0} onClick={() => void previewRoute()}>{routingBusy ? "Routing…" : "Preview route"}</button>
               {sendBusy ? <button className="stop" type="button" onClick={() => void cancelRun()}>Stop</button> :
-                <button className="send" type="button" disabled={project === null || (task.trim().length === 0 && attachments.length === 0)} onClick={() => void sendTask()}>Send ↵</button>}
+                <button className="send" type="button" disabled={project === null || (task.trim().length === 0 && attachments.length === 0)} onClick={() => void sendTask()}>Send <CornerDownLeft size={14} aria-hidden="true" /></button>}
             </div></div></div>
         </div>}
       </section>
