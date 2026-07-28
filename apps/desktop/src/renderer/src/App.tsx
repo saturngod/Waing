@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { AppInfo, AttachmentChoice, SessionSendResult } from "@waing/ipc-contracts";
+import type { AppInfo, AttachmentChoice, ConversationHistory, SessionSendResult } from "@waing/ipc-contracts";
 import type { AgentDescriptor, AgentEvent, AppConversation, AutoSelection, PermissionRequest, Project, StepAnnouncement } from "@waing/domain";
 import { ActivityTimeline } from "./ActivityTimeline";
 import type { TimelineStep } from "./ActivityTimeline";
@@ -20,6 +20,14 @@ function savedTheme(): ThemePreference {
 
 const tokenFormat = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 });
 const compactTokens = (value: number): string => tokenFormat.format(value);
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+type HistoryMessage = { id: string; role: "user" | "assistant"; content: string };
+
+function visibleHistoryMessages(messages: ConversationHistory["messages"]): HistoryMessage[] {
+  return messages.flatMap((message, index) => message.role === "user" || message.role === "assistant"
+    ? [{ id: `${message.createdAt}-${message.role}-${String(index)}`, role: message.role, content: message.content }]
+    : []);
+}
 
 /** Turns the newest still-pending step into its resolved form, so a router chip is not duplicated. */
 function replaceLast(steps: TimelineStep[], state: TimelineStep["state"], resolved: TimelineStep): TimelineStep[] {
@@ -44,6 +52,7 @@ export function App() {
   const [agents, setAgents] = useState<AgentDescriptor[]>([]);
   const [task, setTask] = useState("");
   const [attachments, setAttachments] = useState<AttachmentChoice[]>([]);
+  const [attachmentDragActive, setAttachmentDragActive] = useState(false);
   const [prompt, setPrompt] = useState<string>();
   const [routing, setRouting] = useState<AutoSelection>();
   const [routingBusy, setRoutingBusy] = useState(false);
@@ -57,12 +66,15 @@ export function App() {
   const [agentMeta, setAgentMeta] = useState<Record<string, string>>({});
   const [activeStep, setActiveStep] = useState<StepAnnouncement>();
   const [openConversationId, setOpenConversationId] = useState<string>();
+  const [historyMessages, setHistoryMessages] = useState<HistoryMessage[]>([]);
   const [replayText, setReplayText] = useState<string>();
   const [menuFor, setMenuFor] = useState<{ id: string; x: number; y: number }>();
+  const [projectMenuFor, setProjectMenuFor] = useState<{ id: string; x: number; y: number }>();
   const [view, setView] = useState<View>("chat");
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [rightSidebarOpen, setRightSidebarOpen] = useState(true);
   const [theme, setTheme] = useState<ThemePreference>(savedTheme);
-  const [confirmingRemoval, setConfirmingRemoval] = useState(false);
+  const [confirmingRemoval, setConfirmingRemoval] = useState<string>();
   const [routingNeedsReview, setRoutingNeedsReview] = useState(false);
   const selectedProjectIdRef = useRef<string | undefined>(undefined);
   const workflowProjectRef = useRef(new Map<string, string>());
@@ -116,13 +128,13 @@ export function App() {
         setRunningProjectIds((current) => new Set(current).add(event.projectId));
         setActiveRunByProject((current) => ({ ...current, [event.projectId]: event.workflowRunId }));
         const now = new Date().toISOString();
-        const runningConversation: AppConversation = { id: event.workflowRunId, projectId: event.projectId,
+        const runningConversation: AppConversation = { id: event.conversationId, projectId: event.projectId,
           title: pendingTaskTitleRef.current.get(event.projectId) ?? "Running task", createdAt: now, updatedAt: now };
         setConversationsByProject((current) => ({ ...current, [event.projectId]: [runningConversation,
-          ...(current[event.projectId] ?? []).filter((item) => item.id !== event.workflowRunId)] }));
+          ...(current[event.projectId] ?? []).filter((item) => item.id !== event.conversationId)] }));
         if (event.projectId === selectedProjectIdRef.current) {
-          setConversations((current) => [runningConversation, ...current.filter((item) => item.id !== event.workflowRunId)]);
-          setActiveSessionId(event.workflowRunId); setOpenConversationId(event.workflowRunId); setRouterStep("idle");
+          setConversations((current) => [runningConversation, ...current.filter((item) => item.id !== event.conversationId)]);
+          setActiveSessionId(event.workflowRunId); setOpenConversationId(event.conversationId); setRouterStep("idle");
         }
       }
       const selected = event.projectId === selectedProjectIdRef.current;
@@ -151,7 +163,7 @@ export function App() {
         const { announcement } = event; setActiveStep(announcement);
         if (announcement.role !== "router") {
           setAgentMeta((current) => ({ ...current, [announcement.agentId]:
-            [announcement.modelDisplayName ?? announcement.modelId, announcement.effort].filter((part) => part !== undefined).join(" · ") }));
+            `Model: ${announcement.modelDisplayName ?? announcement.modelId ?? "Provider default"} · Effort: ${announcement.effort ?? "Provider default"}` }));
           setWorkflowSteps((current) => [...current, { id: announcement.stepRunId, title: announcement.message,
             detail: [announcement.agentDisplayName, announcement.modelDisplayName ?? announcement.modelId, announcement.effort]
               .filter((part) => part !== undefined).join(" · "), state: "pending" }]);
@@ -182,7 +194,7 @@ export function App() {
 
   useEffect(() => {
     selectedProjectIdRef.current = project?.id;
-    setConfirmingRemoval(false);
+    setConfirmingRemoval(undefined); setProjectMenuFor(undefined);
     if (project === null) { setConversations([]); return; }
     void window.waing.conversations.list(project.id).then((items) => {
       setConversations(items);
@@ -259,10 +271,12 @@ export function App() {
     }
   }
 
-  async function beginNewTask(): Promise<void> {
-    if (sendBusy) return;
-    const target = project ?? await chooseProject();
+  async function beginNewTask(forProject?: Project): Promise<void> {
+    if (forProject !== undefined ? runningProjectIds.has(forProject.id) : sendBusy) return;
+    const target = forProject ?? project ?? await chooseProject();
     if (target === null) return;
+    setProjectMenuFor(undefined); setConfirmingRemoval(undefined);
+    if (target.id !== project?.id) selectProject(target);
     clearTranscript(); setReplayText(undefined); setTask(""); setAttachments([]); setError(undefined);
     window.requestAnimationFrame(() => composerRef.current?.focus());
   }
@@ -276,23 +290,46 @@ export function App() {
     } catch (reason) { reportError(reason); }
   }
 
-  function closeProject(): void {
-    setProject(null); setConfirmingRemoval(false); setEvents([]); setPrompt(undefined); setAttachments([]);
-    setRouting(undefined); setPermission(undefined); setActiveSessionId(undefined); setResolvedAgentId(undefined);
-  }
-
-  async function removeProject(): Promise<void> {
-    if (project === null) return;
+  async function addAttachmentFiles(files: readonly File[]): Promise<void> {
+    const availableSlots = 10 - attachments.length;
+    if (availableSlots <= 0) { setError("A task can include at most 10 attachments"); return; }
+    const selected = files.slice(0, availableSlots);
+    const oversized = selected.find((file) => file.size > MAX_ATTACHMENT_BYTES);
+    if (oversized !== undefined) { setError(`${oversized.name || "Image"} is larger than 20 MB`); return; }
+    if (selected.length === 0) return;
     setError(undefined);
     try {
-      const remaining = await window.waing.projects.remove(project.id);
+      const uploads = await Promise.all(selected.map(async (file, index) => ({
+        name: file.name || `pasted-image-${String(index + 1)}.png`,
+        mimeType: file.type || "application/octet-stream",
+        bytes: new Uint8Array(await file.arrayBuffer()),
+      })));
+      const choices = await window.waing.attachments.add(uploads);
+      setAttachments((current) => [...current, ...choices].slice(0, 10));
+    } catch (reason) { reportError(reason); }
+  }
+
+  async function revealProject(projectId: string): Promise<void> {
+    setProjectMenuFor(undefined); setMenuFor(undefined); setError(undefined);
+    try { await window.waing.projects.reveal(projectId); }
+    catch (reason) { reportError(reason); }
+  }
+
+  async function removeProject(projectId: string): Promise<void> {
+    const removed = projects.find((item) => item.id === projectId);
+    if (removed === undefined) return;
+    setError(undefined);
+    try {
+      const remaining = await window.waing.projects.remove(projectId);
       setProjects(remaining);
-      setConversationsByProject((current) => { const next = { ...current }; delete next[project.id]; return next; });
-      setConfirmingRemoval(false);
-      setProject(remaining[0] ?? null);
-      setEvents([]); setRouting(undefined); setPermission(undefined); setPrompt(undefined);
-      setActiveSessionId(undefined); setResolvedAgentId(undefined);
-    } catch (reason) { setConfirmingRemoval(false); reportError(reason); }
+      setConversationsByProject((current) => { const next = { ...current }; delete next[projectId]; return next; });
+      setConfirmingRemoval(undefined); setProjectMenuFor(undefined);
+      if (project?.id === projectId) {
+        setProject(remaining[0] ?? null);
+        setEvents([]); setRouting(undefined); setPermission(undefined); setPrompt(undefined);
+        setActiveSessionId(undefined); setResolvedAgentId(undefined);
+      }
+    } catch (reason) { setConfirmingRemoval(undefined); reportError(reason); }
   }
 
   async function answerPermission(decision: "allow_once" | "allow_session" | "deny"): Promise<void> {
@@ -306,6 +343,7 @@ export function App() {
     setEvents([]); setPrompt(undefined); setWorkflowSteps([]); setAgentMeta({}); setActiveStep(undefined);
     setRouting(undefined); setRoutedBy(undefined); setPermission(undefined); setResolvedAgentId(undefined);
     setResolvedModel(undefined); setResolvedEffort(undefined); setActiveSessionId(undefined); setOpenConversationId(undefined);
+    setHistoryMessages([]);
   }
 
   async function openConversation(conversationId: string): Promise<void> {
@@ -315,13 +353,14 @@ export function App() {
       const history = await window.waing.conversations.history(conversationId);
       clearTranscript();
       setOpenConversationId(conversationId);
-      // Deltas were never persisted, so the replay leans on message.completed events and the stored message rows.
-      setPrompt(history.messages.find((message) => message.role === "user")?.content ?? history.conversation.title);
-      const replay = history.events.filter((event) => event.type !== "permission.requested");
+      setHistoryMessages(visibleHistoryMessages(history.messages));
+      const replay = history.events.filter((event) => event.type !== "permission.requested"
+        && event.type !== "message.delta" && event.type !== "message.completed");
       setEvents(replay);
-      if (!replay.some((event) => event.type === "message.completed")) {
-        setReplayText(history.messages.filter((message) => message.role === "assistant").map((message) => message.content).join("\n\n"));
-      } else setReplayText(undefined);
+      setAgentMeta(Object.fromEntries(history.announcements.filter((announcement) => announcement.role !== "router")
+        .map((announcement) => [announcement.agentId,
+          `Model: ${announcement.modelDisplayName ?? announcement.modelId ?? "Provider default"} · Effort: ${announcement.effort ?? "Provider default"}`])));
+      setReplayText(undefined); setPrompt(undefined);
       followRef.current = true;
     } catch (reason) { reportError(reason); }
   }
@@ -349,9 +388,17 @@ export function App() {
     if (project === null || (task.trim().length === 0 && attachments.length === 0)) return;
     const text = task.trim().length === 0 ? "Please review the attached files." : task.trim();
     const selectedAttachments = attachments;
+    const continuingConversationId = openConversationId;
+    if (continuingConversationId !== undefined) {
+      try {
+        const history = await window.waing.conversations.history(continuingConversationId);
+        setHistoryMessages(visibleHistoryMessages(history.messages));
+      } catch (reason) { reportError(reason); return; }
+    }
     setError(undefined); setRouting(undefined); setEvents([]); setPermission(undefined);
     setRunningProjectIds((current) => new Set(current).add(project.id));
-    pendingTaskTitleRef.current.set(project.id, text.slice(0, 80));
+    pendingTaskTitleRef.current.set(project.id,
+      conversations.find((conversation) => conversation.id === continuingConversationId)?.title ?? text.slice(0, 80));
     setPrompt(text); setTask(""); setAttachments([]); setRoutedBy(undefined); setResolvedAgentId(undefined);
     setResolvedModel(undefined); setResolvedEffort(undefined);
     setWorkflowSteps([]); setAgentMeta({}); setActiveStep(undefined); setActiveSessionId(undefined);
@@ -360,11 +407,13 @@ export function App() {
     try {
       // Always Auto: the router picks the role, and that role's saved profile supplies provider, model, and effort.
       const result = await window.waing.sessions.send({ projectId: project.id, text, agentId: "auto", mode: "execute",
+        ...(continuingConversationId === undefined ? {} : { conversationId: continuingConversationId }),
         ...(selectedAttachments.length === 0 ? {} : { attachmentIds: selectedAttachments.map((item) => item.id) }) });
       if (result.session !== undefined) setActiveSessionId(result.session.id);
       setResolvedAgentId(result.resolvedAgentId);
       setResolvedModel(result.resolvedModel); setResolvedEffort(result.resolvedEffort);
       setRoutedBy(result.routing); setRouterStep("idle");
+      setOpenConversationId(result.conversation.id);
       // A workflow reports its own terminal event; a single agent run is already finished when send resolves.
       if (result.workflowRunId === undefined) {
         setRunningProjectIds((current) => { const next = new Set(current); next.delete(project.id); return next; });
@@ -389,7 +438,9 @@ export function App() {
   }
 
   return (
-    <main className={`app-shell platform-${info?.platform ?? "unknown"} ${view === "settings" ? "settings" : sidebarOpen ? "" : "sidebar-collapsed"}`}>
+    <main className={`app-shell platform-${info?.platform ?? "unknown"} ${view === "settings" ? "settings" : [
+      sidebarOpen ? "" : "sidebar-collapsed", rightSidebarOpen ? "" : "right-sidebar-collapsed",
+    ].filter(Boolean).join(" ")}`}>
       {/* Settings are global, so the project and conversation rail is hidden there rather than implying a scope. */}
       {view === "chat" && sidebarOpen && <aside className="context-sidebar">
         <div className="sidebar-chrome"><span className="traffic-light-space" aria-hidden="true" />
@@ -408,42 +459,62 @@ export function App() {
             const running = runningProjectIds.has(item.id);
             const items = active ? conversations : conversationsByProject[item.id] ?? [];
             return <section className={`project-group ${active ? "active" : ""}`} key={item.id}>
-              <button className="project-row" type="button" aria-expanded={active} title={item.root} onClick={() => selectProject(item)}>
-                <span className="folder-icon" aria-hidden="true" />
-                <strong>{item.name}</strong>
-                {running && <span className={`task-running ${permissionsByProject[item.id] === undefined ? "" : "attention"}`}
-                  title={permissionsByProject[item.id] === undefined ? "Task running" : "Permission needed"} />}
-                <span className="project-chevron">{active ? "⌄" : "›"}</span>
-              </button>
+              <div className="project-row-wrap">
+                <button className="project-row" type="button" aria-expanded={active} title={item.root}
+                  onClick={() => { setProjectMenuFor(undefined); selectProject(item); }}
+                  onContextMenu={(event) => { event.preventDefault(); setMenuFor(undefined); setConfirmingRemoval(undefined);
+                    setProjectMenuFor({ id: item.id, x: event.clientX, y: event.clientY }); }}>
+                  <span className="folder-icon" aria-hidden="true" />
+                  <strong>{item.name}</strong>
+                  {running && <span className={`task-running ${permissionsByProject[item.id] === undefined ? "" : "attention"}`}
+                    title={permissionsByProject[item.id] === undefined ? "Task running" : "Permission needed"} />}
+                </button>
+                <button className="project-menu-trigger" type="button" aria-label={`Project actions for ${item.name}`} title="Project actions"
+                  onClick={(event) => { const bounds = event.currentTarget.getBoundingClientRect(); setMenuFor(undefined);
+                    setConfirmingRemoval(undefined); setProjectMenuFor({ id: item.id, x: Math.max(8, bounds.right - 190), y: bounds.bottom + 3 }); }}>•••</button>
+              </div>
               {active && <div className="conversation-list">{items.length === 0 ? <p>No tasks yet</p> : items.map((conversation) =>
                 <button type="button" key={conversation.id} className={openConversationId === conversation.id ? "active" : ""}
                   disabled={sendBusy} title={sendBusy ? "Stop the running task first" : conversation.title}
                   onClick={() => void openConversation(conversation.id)}
-                  onContextMenu={(event) => { event.preventDefault(); setMenuFor({ id: conversation.id, x: event.clientX, y: event.clientY }); }}>
+                  onContextMenu={(event) => { event.preventDefault(); setProjectMenuFor(undefined);
+                    setMenuFor({ id: conversation.id, x: event.clientX, y: event.clientY }); }}>
                   <span>{conversation.title}</span>{conversation.id === activeSessionId && <i className="task-running" title="Running" />}
                 </button>)}</div>}
             </section>;
           })}</div>
-        {project !== null && <div className="project-actions">
-          {confirmingRemoval ? <>
-            <span>Remove {project.name} and its local history?</span>
-            <button type="button" onClick={() => setConfirmingRemoval(false)}>Cancel</button>
-            <button className="danger" type="button" onClick={() => void removeProject()}>Confirm remove</button>
-          </> : <>
-            <button type="button" onClick={closeProject}>Close project</button>
-            <button type="button" disabled={sendBusy} title={sendBusy ? "Stop the running task first" : undefined}
-              onClick={() => setConfirmingRemoval(true)}>Remove…</button>
-          </>}
-        </div>}
+        {projectMenuFor !== undefined && <>
+          <div className="menu-backdrop" onClick={() => { setProjectMenuFor(undefined); setConfirmingRemoval(undefined); }}
+            onContextMenu={(event) => { event.preventDefault(); setProjectMenuFor(undefined); setConfirmingRemoval(undefined); }} />
+          <div className="context-menu project-context-menu" style={{ left: projectMenuFor.x, top: projectMenuFor.y }}
+            role="menu" aria-label="Project actions">
+            {confirmingRemoval === projectMenuFor.id ? <div className="project-remove-confirm">
+              <p>Remove this project and its local chat history?</p><div>
+                <button type="button" onClick={() => setConfirmingRemoval(undefined)}>Cancel</button>
+                <button type="button" className="danger" onClick={() => void removeProject(projectMenuFor.id)}>Remove</button>
+              </div></div> : <>
+              <button type="button" role="menuitem" disabled={runningProjectIds.has(projectMenuFor.id)}
+                title={runningProjectIds.has(projectMenuFor.id) ? "Stop this project's running task first" : undefined} onClick={() => {
+                const target = projects.find((item) => item.id === projectMenuFor.id);
+                if (target !== undefined) void beginNewTask(target);
+              }}><span aria-hidden="true">＋</span>New chat</button>
+              <button type="button" role="menuitem" onClick={() => void revealProject(projectMenuFor.id)}>
+                <span aria-hidden="true">⌕</span>Reveal in Finder</button>
+              <button type="button" role="menuitem" className="danger" disabled={runningProjectIds.has(projectMenuFor.id)}
+                title={runningProjectIds.has(projectMenuFor.id) ? "Stop the running task first" : undefined}
+                onClick={() => setConfirmingRemoval(projectMenuFor.id)}><span aria-hidden="true">×</span>Remove</button>
+            </>}
+          </div>
+        </>}
         {menuFor !== undefined && <>
           <div className="menu-backdrop" onClick={() => setMenuFor(undefined)} onContextMenu={(event) => { event.preventDefault(); setMenuFor(undefined); }} />
           <div className="context-menu" style={{ left: menuFor.x, top: menuFor.y }} role="menu" aria-label="Conversation actions">
+            <button type="button" role="menuitem" onClick={() => project !== null && void revealProject(project.id)}>Reveal in Finder</button>
             <button type="button" role="menuitem" className="danger" onClick={() => void removeConversation(menuFor.id)}>Delete conversation</button>
           </div>
         </>}
         <div className="sidebar-footer"><button type="button" aria-label="Settings" onClick={() => setView("settings")}>
-          <span aria-hidden="true">⚙</span> Settings</button>
-          <small>{info === undefined ? "Starting…" : `${info.name} · ${info.platform}`}</small></div>
+          <span aria-hidden="true">⚙</span> Settings</button></div>
       </aside>}
       <section className="workspace">
         <header className="topbar">
@@ -467,6 +538,13 @@ export function App() {
               <button type="button" onClick={() => setView("chat")}>Open chat</button>
             </>}
           </div>}
+          {view === "chat" && <button className="sidebar-toggle right-sidebar-toggle" type="button"
+            aria-label={rightSidebarOpen ? "Hide right sidebar" : "Show right sidebar"}
+            title={rightSidebarOpen ? "Hide right sidebar" : "Show right sidebar"}
+            aria-expanded={rightSidebarOpen} aria-controls="run-inspector"
+            onClick={() => setRightSidebarOpen((open) => !open)}>
+            <span className="sidebar-toggle-icon right" aria-hidden="true" />
+          </button>}
         </header>
         {routingNeedsReview && <div className="routing-banner" role="status">
           <span>Auto routing is using defaults built from your installed providers.</span>
@@ -481,7 +559,7 @@ export function App() {
           {view === "settings" ? <SettingsPanel agents={agents} eventCount={events.length}
             theme={theme} onThemeChange={setTheme}
             onRolesSaved={(needsReview) => setRoutingNeedsReview(needsReview)} onBack={() => setView("chat")} /> :
-            <><ActivityTimeline events={events} steps={steps} agentMeta={agentMeta}
+            <><ActivityTimeline events={events} steps={steps} agentMeta={agentMeta} historyMessages={historyMessages}
               {...(project === null ? {} : { projectId: project.id })} {...(prompt === undefined ? {} : { prompt })}
               {...(replayText === undefined || replayText.length === 0 ? {} : { replayText })}
               {...(modelLabel === undefined ? {} : { model: modelLabel })} {...(effortLabel === undefined ? {} : { effort: effortLabel })} />
@@ -492,20 +570,28 @@ export function App() {
                 {permission.kind === "destructive" && <p className="destructive-warning">This action may be irreversible. Review every target before allowing it.</p>}
                 {permission.command !== undefined && <code>{permission.command.join(" ")}</code>}
                 {permission.paths?.map((path) => <code key={path}>{path}</code>)}
-                <div className="permission-actions"><button type="button" onClick={() => void answerPermission("deny")}>Deny</button>
-                  <button type="button" onClick={() => void answerPermission("allow_once")}>Allow once</button>
-                  {permission.kind !== "destructive" && <button type="button" onClick={() => void answerPermission("allow_session")}>Allow for session</button>}</div>
+                <div className="permission-actions"><button className="deny" type="button" onClick={() => void answerPermission("deny")}>Deny</button>
+                  <button className={permission.kind === "destructive" ? "primary" : ""} type="button"
+                    onClick={() => void answerPermission("allow_once")}>Allow once</button>
+                  {permission.kind !== "destructive" && <button className="primary" type="button"
+                    onClick={() => void answerPermission("allow_session")}>Allow for session</button>}</div>
               </section>}</>}
           {error !== undefined && <p className="error" role="alert">{error}</p>}
-          {lastEvent !== undefined && <output data-testid="last-event">{lastEvent}</output>}
+          {lastEvent !== undefined && <output className="event-probe" data-testid="last-event">{lastEvent}</output>}
         </div>
         {view === "chat" && <div className="composer-wrap">
-          <div className="composer">{attachments.length > 0 && <ul className="composer-attachments" aria-label="Attached files">
+          <div className={`composer${attachmentDragActive ? " attachment-drag-active" : ""}`}
+            onDragEnter={(event) => { if (event.dataTransfer.types.includes("Files")) { event.preventDefault(); setAttachmentDragActive(true); } }}
+            onDragOver={(event) => { if (event.dataTransfer.types.includes("Files")) { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; } }}
+            onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setAttachmentDragActive(false); }}
+            onDrop={(event) => { event.preventDefault(); setAttachmentDragActive(false); void addAttachmentFiles([...event.dataTransfer.files]); }}>
+            {attachments.length > 0 && <ul className="composer-attachments" aria-label="Attached files">
             {attachments.map((attachment) => <li key={attachment.id}><span aria-hidden="true">{attachment.kind === "image" ? "▧" : "▤"}</span>
               <span title={attachment.name}>{attachment.name}</span><button type="button" aria-label={`Remove ${attachment.name}`}
                 onClick={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))}>×</button></li>)}</ul>}
             <textarea ref={composerRef} aria-label="Message" value={task} onChange={(event) => setTask(event.target.value)}
             placeholder="Ask an agent to inspect, explain, or change this project…" rows={3}
+            onPaste={(event) => { const files = [...event.clipboardData.files]; if (files.length > 0) { event.preventDefault(); void addAttachmentFiles(files); } }}
             onKeyDown={(event) => { if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) void sendTask(); }} />
             <div><div className="composer-context"><button className="attach-button" type="button" aria-label="Attach files and images"
               title="Attach files and images" onClick={() => void chooseAttachments()}>＋</button>
@@ -516,7 +602,7 @@ export function App() {
             </div></div></div>
         </div>}
       </section>
-      {view === "chat" && <aside className="inspector">
+      {view === "chat" && rightSidebarOpen && <aside className="inspector" id="run-inspector">
         <section><p className="eyebrow">Run details</p><dl><div><dt>Status</dt><dd>{sendBusy ? "Running" : lastEvent === undefined ? "Ready" : lastEvent}</dd></div>
           <div><dt>Provider</dt><dd>{providerLabel}</dd></div>
           <div><dt>Model</dt><dd>{modelLabel ?? "Provider default"}</dd></div>

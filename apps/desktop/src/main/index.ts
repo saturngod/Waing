@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { realpath, writeFile } from "node:fs/promises";
+import { rmSync } from "node:fs";
+import { mkdir, realpath, writeFile } from "node:fs/promises";
 import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import { AgentManager, PermissionManager, canonicalizeWorkspaceRoot, redactSensitiveData } from "@waing/agent-core";
@@ -14,7 +15,7 @@ import { AgentStepExecutor, InMemoryWorkflowRepository, ROLE_ORDER, WorkflowComp
 import type { GlobalRoleProfiles } from "@waing/workflow";
 import { PersistenceStore, SqliteDatabase, SqliteWorkflowRepository } from "@waing/persistence";
 import { IPC_CHANNELS, agentModelsInputSchema, conversationIdInputSchema, conversationRemoveInputSchema, emptyInputSchema,
-  permissionResponseInputSchema, projectIdInputSchema, roleProfilesInputSchema, routerPreviewInputSchema, runFakeInputSchema,
+  attachmentChoiceSchema, attachmentsAddInputSchema, permissionResponseInputSchema, projectIdInputSchema, roleProfilesInputSchema, routerPreviewInputSchema, runFakeInputSchema,
   sessionCancelInputSchema, sessionSendInputSchema, workflowRunInputSchema, openLinkInputSchema } from "@waing/ipc-contracts";
 import type { AttachmentChoice, ConversationHistory, RoleProfilesView, SessionSendResult } from "@waing/ipc-contracts";
 import type { AgentDescriptor, AgentRequest, AppConversation, Project, RoleExecutionProfile } from "@waing/domain";
@@ -25,7 +26,10 @@ const projects = new Map<string, Project>();
 const agentManager = new AgentManager();
 const permissionManager = new PermissionManager();
 const assistantBuffers = new Map<string, string>();
+/** Workflow step sessions use the run id internally; persistence and the UI use the stable app conversation id. */
+const workflowConversationIds = new Map<string, string>();
 const selectedAttachments = new Map<string, AttachmentChoice & { path: string }>();
+let attachmentTempDirectory: string | undefined;
 const trustedWebContents = new Set<number>();
 let database: SqliteDatabase | undefined;
 let persistence: PersistenceStore | undefined;
@@ -42,6 +46,10 @@ const IMAGE_MIME_TYPES: Record<string, string> = { ".png": "image/png", ".jpg": 
 function attachmentMimeType(path: string): string {
   return IMAGE_MIME_TYPES[extname(path).toLocaleLowerCase()] ?? "application/octet-stream";
 }
+function safeAttachmentExtension(name: string): string {
+  const extension = extname(basename(name));
+  return /^\.[a-z0-9]{1,10}$/iu.test(extension) ? extension.toLocaleLowerCase() : "";
+}
 function takeAttachments(ids: readonly string[] | undefined): Array<AttachmentChoice & { path: string }> {
   if (ids === undefined) return [];
   return ids.map((id) => {
@@ -54,6 +62,14 @@ function taskWithAttachments(text: string, attachments: ReadonlyArray<Attachment
   if (attachments.length === 0) return text;
   const references = attachments.map((item) => `- ${item.name.replaceAll(/[\r\n]/g, " ")} (${item.mimeType}): ${item.path}`);
   return `${text}\n\nUser-selected attachments:\n${references.join("\n")}\nUse these files as task context.`;
+}
+/** Gives a fresh routed workflow enough bounded history to understand a follow-up without changing the user's text. */
+function taskWithConversationHistory(text: string, messages: ReadonlyArray<{ role: string; content: string }>): string {
+  if (messages.length === 0) return text;
+  const transcript = messages.slice(-20).map((message) => `${message.role.toUpperCase()}: ${message.content}`).join("\n\n");
+  const boundedTranscript = transcript.length > 20_000 ? transcript.slice(-20_000) : transcript;
+  return `Continue the existing Waing conversation. Use its prior plan, decisions, and results as context.\n\n`
+    + `Prior conversation:\n${boundedTranscript}\n\nNew user message:\n${text}`;
 }
 export function getSecretStore(): SecretStore {
   if (secretStore === undefined) throw new Error("Secret storage is not initialized");
@@ -94,10 +110,11 @@ agentManager.eventBus.subscribe((event) => {
   const safeEvent = redactSensitiveData(event);
   try {
     const session = agentManager.sessions.get(event.sessionId);
-    persistence?.saveProviderSession({ id: session.id, conversationId: session.conversationId, agentId: session.agentId,
+    const conversationId = workflowConversationIds.get(session.conversationId) ?? session.conversationId;
+    persistence?.saveProviderSession({ id: session.id, conversationId, agentId: session.agentId,
       ...(session.providerSessionId === undefined ? {} : { providerSessionId: session.providerSessionId }),
       status: session.status, payload: session, updatedAt: session.updatedAt });
-    persistence?.saveSignificantEvent(session.conversationId, safeEvent);
+    persistence?.saveSignificantEvent(conversationId, safeEvent);
     if (safeEvent.type === "message.delta") {
       assistantBuffers.set(session.id, `${assistantBuffers.get(session.id) ?? ""}${safeEvent.text}`);
     } else if (safeEvent.type === "message.completed") {
@@ -105,7 +122,7 @@ agentManager.eventBus.subscribe((event) => {
     } else if (safeEvent.type === "run.completed") {
       const content = assistantBuffers.get(session.id);
       if (content !== undefined && content.length > 0) persistence?.saveMessage({ id: randomUUID(),
-        conversationId: session.conversationId, role: "assistant", content, createdAt: safeEvent.timestamp });
+        conversationId, role: "assistant", content, createdAt: safeEvent.timestamp });
       assistantBuffers.delete(session.id);
     }
   } catch { /* workflow/session setup can race the first normalized event */ }
@@ -161,7 +178,8 @@ function createRouterClient(profile: RoleExecutionProfile | undefined, project: 
  * Step providers, models, and efforts come from the saved role profiles, and every engine event is forwarded to the
  * renderer so the chat transcript shows each agent as it starts.
  */
-async function runChatWorkflow(project: Project, task: string, workflowTask = task): Promise<SessionSendResult> {
+async function runChatWorkflow(project: Project, task: string, workflowTask = task,
+  existingConversation?: AppConversation): Promise<SessionSendResult> {
   const { profiles } = await resolveRoleProfiles();
   await assertRolesUsable(profiles);
   const routerProfile = profiles.find((profile) => profile.role === "router");
@@ -172,23 +190,23 @@ async function runChatWorkflow(project: Project, task: string, workflowTask = ta
   const routerClient = createRouterClient(routerProfile, project, (sessionId) => ownedRouterSessionIds.add(sessionId));
   // A router call may have to cold-start a provider CLI, which routinely outlasts the 15s library default.
   const engine = new WorkflowEngine(repository, new AgentStepExecutor(agentManager), new RouterManager(routerClient, ROUTER_TIMEOUT_MS));
-  const title = task.slice(0, 80);
-  let conversation: AppConversation = { id: randomUUID(), projectId: project.id, title,
+  const title = existingConversation?.title ?? task.slice(0, 80);
+  let conversation: AppConversation = existingConversation ?? { id: randomUUID(), projectId: project.id, title,
     createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
   let workflowRunId: string | undefined;
   const unsubscribe = engine.events.subscribe((event) => {
     if (event.type === "workflow.started") {
-      // Step sessions use the workflow run id as their conversation id, so the row has to exist under that id.
       const now = new Date().toISOString();
-      conversation = { id: event.workflowRunId, projectId: project.id, title, createdAt: now, updatedAt: now };
+      conversation = { ...conversation, updatedAt: now };
       persistence?.saveConversation(conversation);
       persistence?.saveMessage({ id: randomUUID(), conversationId: conversation.id, role: "user", content: task, createdAt: now });
       workflowRunId = event.workflowRunId;
+      workflowConversationIds.set(event.workflowRunId, conversation.id);
       activeChatRuns.set(event.workflowRunId, engine);
     }
     const runId = event.type === "workflow.started" ? event.workflowRunId : workflowRunId;
     if (runId !== undefined) {
-      const desktopEvent = { ...event, workflowRunId: runId, projectId: project.id };
+      const desktopEvent = { ...event, workflowRunId: runId, projectId: project.id, conversationId: conversation.id };
       for (const window of BrowserWindow.getAllWindows()) window.webContents.send(IPC_CHANNELS.workflowsEvent, desktopEvent);
     }
   });
@@ -201,6 +219,7 @@ async function runChatWorkflow(project: Project, task: string, workflowTask = ta
   } finally {
     unsubscribe();
     if (workflowRunId !== undefined) activeChatRuns.delete(workflowRunId);
+    if (workflowRunId !== undefined) workflowConversationIds.delete(workflowRunId);
     await routerClient.shutdown();
     for (const sessionId of ownedRouterSessionIds) routerSessionIds.delete(sessionId);
   }
@@ -274,6 +293,13 @@ function registerIpc(): void {
     projects.delete(projectId);
     return [...projects.values()];
   });
+  ipcMain.handle(IPC_CHANNELS.projectsReveal, (event, input: unknown) => {
+    assertTrustedIpc(event);
+    const { projectId } = projectIdInputSchema.parse(input);
+    const project = projects.get(projectId);
+    if (project === undefined) throw new Error("Unknown project");
+    shell.showItemInFolder(project.root);
+  });
   ipcMain.handle(IPC_CHANNELS.systemOpenLink, async (event, input: unknown) => {
     assertTrustedIpc(event);
     const { target, projectId } = openLinkInputSchema.parse(input);
@@ -307,14 +333,15 @@ function registerIpc(): void {
     // Reading history is scoped to projects the session actually has open, never an arbitrary row id.
     if (conversation === undefined || !projects.has(conversation.projectId)) throw new Error("Unknown conversation");
     return { conversation, messages: persistence?.listMessages(conversationId) ?? [],
-      events: persistence?.listEvents(conversationId) ?? [] } satisfies ConversationHistory;
+      events: persistence?.listEvents(conversationId) ?? [],
+      announcements: workflowRepository?.loadHistory(conversationId).announcements ?? [] } satisfies ConversationHistory;
   });
   ipcMain.handle(IPC_CHANNELS.conversationsRemove, (event, input: unknown) => {
     assertTrustedIpc(event);
     const { conversationId, projectId } = conversationRemoveInputSchema.parse(input);
     if (!projects.has(projectId)) throw new Error("Unknown project");
     if (persistence?.getConversation(conversationId)?.projectId !== projectId) throw new Error("Unknown conversation");
-    if (activeChatRuns.has(conversationId)) throw new Error("Stop the running task before removing this conversation");
+    if ([...workflowConversationIds.values()].includes(conversationId)) throw new Error("Stop the running task before removing this conversation");
     persistence?.removeConversation(conversationId);
     return persistence?.listConversations(projectId) ?? [];
   });
@@ -360,18 +387,47 @@ function registerIpc(): void {
     }
     return choices;
   });
+  ipcMain.handle(IPC_CHANNELS.attachmentsAdd, async (event, input: unknown): Promise<AttachmentChoice[]> => {
+    assertTrustedIpc(event);
+    const { files } = attachmentsAddInputSchema.parse(input);
+    attachmentTempDirectory ??= join(app.getPath("temp"), `waing-attachments-${String(process.pid)}`);
+    await mkdir(attachmentTempDirectory, { recursive: true });
+    const choices = await Promise.all(files.map(async (file) => {
+      const id = randomUUID();
+      const path = join(attachmentTempDirectory!, `${id}${safeAttachmentExtension(file.name)}`);
+      await writeFile(path, file.bytes, { flag: "wx", mode: 0o600 });
+      const choice: AttachmentChoice & { path: string } = { id, name: basename(file.name), mimeType: file.mimeType,
+        kind: file.mimeType.startsWith("image/") ? "image" : "file", path };
+      selectedAttachments.set(id, choice);
+      return attachmentChoiceSchema.parse({ id: choice.id, name: choice.name, mimeType: choice.mimeType, kind: choice.kind });
+    }));
+    while (selectedAttachments.size > 100) {
+      const oldest = selectedAttachments.keys().next().value;
+      if (oldest === undefined) break; selectedAttachments.delete(oldest);
+    }
+    return choices;
+  });
   ipcMain.handle(IPC_CHANNELS.sessionsSend, async (event, input: unknown) => {
     assertTrustedIpc(event);
     const request = sessionSendInputSchema.parse(input);
     const project = projects.get(request.projectId);
     if (project === undefined) throw new Error("Choose a project before sending a task");
+    const existingConversation = request.conversationId === undefined ? undefined : persistence?.getConversation(request.conversationId);
+    if (request.conversationId !== undefined
+      && (existingConversation === undefined || existingConversation.projectId !== project.id)) throw new Error("Unknown conversation");
+    const priorMessages = existingConversation === undefined ? [] : persistence?.listMessages(existingConversation.id) ?? [];
     const attachments = takeAttachments(request.attachmentIds);
     const effectiveText = taskWithAttachments(request.text, attachments);
+    const contextualText = taskWithConversationHistory(effectiveText, priorMessages);
     // Auto is the multi-agent path: the router picks the implementing role and decides after each stage whether the
     // work still needs a review or documentation. An explicit provider choice stays a single run below.
-    if (request.agentId === "auto" && process.env.WAING_E2E !== "1") return runChatWorkflow(project, request.text, effectiveText);
+    if (request.agentId === "auto" && process.env.WAING_E2E !== "1") {
+      return runChatWorkflow(project, request.text, contextualText, existingConversation);
+    }
     const now = new Date().toISOString();
-    const conversation = { id: randomUUID(), projectId: project.id, title: request.text.slice(0, 80), createdAt: now, updatedAt: now };
+    const conversation: AppConversation = existingConversation === undefined
+      ? { id: randomUUID(), projectId: project.id, title: request.text.slice(0, 80), createdAt: now, updatedAt: now }
+      : { ...existingConversation, updatedAt: now };
     persistence?.saveConversation(conversation);
     persistence?.saveMessage({ id: randomUUID(), conversationId: conversation.id, role: "user", content: request.text, createdAt: now });
     let resolvedAgentId = request.agentId;
@@ -382,8 +438,13 @@ function registerIpc(): void {
         taskType: "feature", mode: "execute", effort: "medium", confidence: 0.92,
         rationale: "The task spans several tested components." } };
     }
-    const session = await agentManager.startSession(resolvedAgentId, { conversationId: conversation.id,
-      projectId: project.id, projectRoot: project.root });
+    const previousSession = persistence?.listProviderSessions(conversation.id)
+      .find((candidate) => candidate.agentId === resolvedAgentId && candidate.providerSessionId !== undefined);
+    const session = previousSession?.providerSessionId === undefined
+      ? await agentManager.startSession(resolvedAgentId, { conversationId: conversation.id,
+        projectId: project.id, projectRoot: project.root })
+      : await agentManager.resumeSession(resolvedAgentId, { conversationId: conversation.id,
+        projectId: project.id, projectRoot: project.root, providerSessionId: previousSession.providerSessionId });
     persistence?.saveProviderSession({ id: session.id, conversationId: conversation.id, agentId: session.agentId,
       ...(session.providerSessionId === undefined ? {} : { providerSessionId: session.providerSessionId }), status: session.status,
       payload: session, updatedAt: session.updatedAt });
@@ -391,7 +452,8 @@ function registerIpc(): void {
     const effort = request.effort;
     const agentAttachments: NonNullable<AgentRequest["attachments"]> = attachments.map((item) =>
       ({ name: item.name, mimeType: item.mimeType, path: item.path }));
-    await agentManager.send(session.id, { text: effectiveText, projectRoot: project.root, mode: request.mode,
+    await agentManager.send(session.id, { text: previousSession === undefined ? contextualText : effectiveText,
+      projectRoot: project.root, mode: request.mode,
       ...(model === undefined ? {} : { model }),
       ...(effort === undefined ? {} : { effort }),
       ...(agentAttachments.length === 0 ? {} : { attachments: agentAttachments }) });
@@ -606,4 +668,7 @@ app.on("before-quit", () => {
   permissionManager.closeAll();
   void agentManager.shutdown();
 });
-app.on("will-quit", () => { database?.close(); database = undefined; persistence = undefined; workflowRepository = undefined; secretStore = undefined; });
+app.on("will-quit", () => {
+  if (attachmentTempDirectory !== undefined) rmSync(attachmentTempDirectory, { recursive: true, force: true });
+  database?.close(); database = undefined; persistence = undefined; workflowRepository = undefined; secretStore = undefined;
+});

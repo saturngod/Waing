@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { AgentDescriptor, RoleExecutionProfile } from "@waing/domain";
 import { RoleProfileGrid } from "./RoleProfileGrid";
 import { PROVIDER_STATUS_HINT, providerDotState, providerStatusLabel } from "./providerStatus";
@@ -23,8 +23,10 @@ export function SettingsPanel({ agents, eventCount, theme, onThemeChange, onRole
   const [exportedPath, setExportedPath] = useState<string>();
   const [profiles, setProfiles] = useState<RoleExecutionProfile[]>([]);
   const [dirty, setDirty] = useState(false);
-  const [saved, setSaved] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveAttempt, setSaveAttempt] = useState(0);
   const [error, setError] = useState<string>();
+  const saveRevision = useRef(0);
   const visibleSections = useMemo(() => {
     const query = search.trim().toLocaleLowerCase();
     return query.length === 0 ? SETTINGS_SECTIONS : SETTINGS_SECTIONS.filter((item) =>
@@ -36,16 +38,26 @@ export function SettingsPanel({ agents, eventCount, theme, onThemeChange, onRole
       .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "Could not load role settings"));
   }, []);
 
+  useEffect(() => {
+    if (!dirty || profiles.length === 0) return;
+    const revision = ++saveRevision.current;
+    const timeout = window.setTimeout(() => {
+      setSaving(true); setError(undefined);
+      void window.waing.settings.saveRoles(profiles).then((view) => {
+        if (revision !== saveRevision.current) return;
+        setProfiles(view.profiles); setDirty(false); setSaving(false); onRolesSaved(view.needsReview);
+      }).catch((reason: unknown) => {
+        if (revision !== saveRevision.current) return;
+        setSaving(false);
+        setError(reason instanceof Error ? reason.message : "Could not save role settings");
+      });
+    }, 400);
+    return () => window.clearTimeout(timeout);
+  }, [dirty, onRolesSaved, profiles, saveAttempt]);
+
   function update(index: number, patch: Partial<RoleExecutionProfile>): void {
-    setDirty(true); setSaved(false);
+    setDirty(true); setError(undefined);
     setProfiles((current) => current.map((profile, item) => item === index ? { ...profile, ...patch } : profile));
-  }
-  async function save(): Promise<void> {
-    setError(undefined);
-    try {
-      const view = await window.waing.settings.saveRoles(profiles);
-      setProfiles(view.profiles); setDirty(false); setSaved(true); onRolesSaved(view.needsReview);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "Could not save role settings"); }
   }
   async function exportDiagnostics(): Promise<void> {
     const path = await window.waing.diagnostics.export(); if (path !== null) setExportedPath(path);
@@ -77,10 +89,10 @@ export function SettingsPanel({ agents, eventCount, theme, onThemeChange, onRole
       {section === "routing" && <><header><p>Settings</p><h2>Roles & routing</h2>
         <span>Choose which provider and model handles each kind of work.</span></header>
         <div className="settings-section routing-settings"><div className="settings-section-heading"><h3>Role assignments</h3>
-          <div>{saved && !dirty && <span>Saved</span>}<button className="primary" type="button"
-            disabled={!dirty || profiles.length === 0} onClick={() => void save()}>{dirty ? "Save routing" : "Saved"}</button></div></div>
+          <span className="settings-save-status" role="status" aria-live="polite">{saving ? "Saving…" : ""}</span></div>
           {profiles.length === 0 ? <p>Loading roles…</p> : <RoleProfileGrid profiles={profiles} agents={agents} onChange={update} />}
-          {error !== undefined && <p className="error" role="alert">{error}</p>}
+          {error !== undefined && <div className="settings-save-error" role="alert"><p>{error}</p>
+            {dirty && <button type="button" onClick={() => setSaveAttempt((attempt) => attempt + 1)}>Retry</button>}</div>}
         </div></>}
 
       {section === "providers" && <><header><p>Settings</p><h2>Providers</h2><span>Installed coding agents and their current availability.</span></header>

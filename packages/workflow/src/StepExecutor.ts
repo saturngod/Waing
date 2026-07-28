@@ -31,7 +31,9 @@ export class AgentStepExecutor implements WorkflowStepExecutor {
   async describe(profile: RoleExecutionProfile): Promise<ResolvedProfileDisplay> {
     const agent = this.agents.registry.get(profile.agentId);
     const descriptor = await agent.discover();
-    const model = profile.modelId === undefined ? undefined : (await agent.listModels()).find((candidate) => candidate.modelId === profile.modelId);
+    const models = await agent.listModels().catch(() => []);
+    const model = profile.modelId === undefined ? models.find((candidate) => candidate.isDefault)
+      : models.find((candidate) => candidate.modelId === profile.modelId);
     return { agentDisplayName: descriptor.displayName,
       ...(model === undefined ? {} : { modelDisplayName: model.displayName }) };
   }

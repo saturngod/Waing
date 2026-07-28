@@ -96,12 +96,14 @@ function sameActivity(left: AgentEvent, right: AgentEvent): boolean {
   return a.title === b.title && a.detail === b.detail;
 }
 
-export function ActivityTimeline({ events, prompt, steps = [], model, effort, agentMeta = {}, replayText, projectId }: {
+export function ActivityTimeline({ events, prompt, steps = [], model, effort, agentMeta = {}, replayText, projectId,
+  historyMessages = [] }: {
   events: AgentEvent[]; prompt?: string; steps?: TimelineStep[]; model?: string; effort?: string;
   agentMeta?: Record<string, string>; replayText?: string; projectId?: string;
+  historyMessages?: Array<{ id: string; role: "user" | "assistant"; content: string }>;
 }) {
   const items = buildChat(events, prompt);
-  const fallbackLabel = [model, effort].filter((part) => part !== undefined && part.length > 0).join(" · ");
+  const fallbackLabel = `Model: ${model ?? "Provider default"} · Effort: ${effort ?? "Provider default"}`;
   const working = items.some((item) => item.kind === "activity" && item.pending)
     || steps.some((step) => step.state === "pending");
 
@@ -111,7 +113,7 @@ export function ActivityTimeline({ events, prompt, steps = [], model, effort, ag
       // Each workflow step can run a different provider, so prefer the model and effort announced for that agent.
       const label = agentMeta[item.agentId] ?? fallbackLabel;
       return <article className="chat-turn agent" key={item.id}>
-        <div className="chat-author">{item.agentId}{label.length > 0 && <span className="chat-meta">{label}</span>}</div>
+        <div className="chat-author">{item.agentId}<span className="chat-meta">{label}</span></div>
         {/* Mid-stream text is often half a fence or table row, so it stays literal until the message settles. */}
         <div className="chat-text">{item.streaming
           ? <>{item.text}<span className="caret" aria-label="Streaming" /></>
@@ -135,7 +137,12 @@ export function ActivityTimeline({ events, prompt, steps = [], model, effort, ag
   };
 
   return <section className="timeline" aria-label="Conversation">
-    {items.length === 0 && steps.length === 0 && <div className="empty-state"><strong>Ready for a task</strong><p>Messages, plans, tools, commands, and files appear here.</p></div>}
+    {items.length === 0 && steps.length === 0 && historyMessages.length === 0
+      && <div className="empty-state"><strong>Ready for a task</strong><p>Messages, plans, tools, commands, and files appear here.</p></div>}
+    {historyMessages.map((message) => message.role === "user"
+      ? <article className="chat-turn user" key={message.id}><div className="bubble">{message.content}</div></article>
+      : <article className="chat-turn agent" key={message.id}><div className="chat-author">assistant</div>
+        <div className="chat-text"><Markdown text={message.content} {...(projectId === undefined ? {} : { projectId })} /></div></article>)}
     {items.filter((item) => item.kind === "user").map(renderItem)}
     {/* Routing runs before the provider starts, so its steps sit between the prompt and the first provider event. */}
     {steps.map((step) => <div className={`chat-activity ${step.state ?? ""}`} key={step.id}>
@@ -147,6 +154,8 @@ export function ActivityTimeline({ events, prompt, steps = [], model, effort, ag
     {replayText !== undefined && <article className="chat-turn agent"><div className="chat-author">summary</div>
       <div className="chat-text"><Markdown text={replayText} {...(projectId === undefined ? {} : { projectId })} /></div></article>}
     {items.filter((item) => item.kind !== "user").map(renderItem)}
-    {working && <div className="task-loading" role="status" aria-label="Agent is working"><i /><i /><i /></div>}
+    {working && <div className="task-loading" role="status" aria-label="Agent is working">
+      <span className="task-loading-spinner" aria-hidden="true" /><span>Working</span>
+    </div>}
   </section>;
 }

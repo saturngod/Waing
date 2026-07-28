@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from "electron";
 import { IPC_CHANNELS } from "@waing/ipc-contracts/channels";
-import type { AppInfo, AttachmentChoice, ConversationHistory, DesktopApi, DesktopWorkflowEvent, RoleProfilesView, SessionSendResult, WorkflowRunView } from "@waing/ipc-contracts";
+import type { AppInfo, AttachmentChoice, AttachmentUpload, ConversationHistory, DesktopApi, DesktopWorkflowEvent, RoleProfilesView, SessionSendResult, WorkflowRunView } from "@waing/ipc-contracts";
 import type { z } from "zod";
 import type { workflowRunInputSchema } from "@waing/ipc-contracts";
 import type { AgentDescriptor, AgentEvent, AgentModelDescriptor, AgentSession, AppConversation, AutoSelection, PermissionDecision, Project, RoleExecutionProfile } from "@waing/domain";
@@ -14,6 +14,7 @@ const desktopApi: DesktopApi = Object.freeze({
   projects: Object.freeze({
     choose: () => invoke<Project | null>(IPC_CHANNELS.projectsChoose),
     list: () => invoke<Project[]>(IPC_CHANNELS.projectsList),
+    reveal: (projectId: string) => ipcRenderer.invoke(IPC_CHANNELS.projectsReveal, { projectId }) as Promise<void>,
     remove: (projectId: string) => ipcRenderer.invoke(IPC_CHANNELS.projectsRemove, { projectId }) as Promise<Project[]>,
   }),
   conversations: Object.freeze({
@@ -30,6 +31,8 @@ const desktopApi: DesktopApi = Object.freeze({
   }),
   attachments: Object.freeze({
     choose: () => invoke<AttachmentChoice[]>(IPC_CHANNELS.attachmentsChoose),
+    add: (files: AttachmentUpload[]) =>
+      ipcRenderer.invoke(IPC_CHANNELS.attachmentsAdd, { files }) as Promise<AttachmentChoice[]>,
   }),
   system: Object.freeze({
     openLink: (target: string, projectId?: string) =>

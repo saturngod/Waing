@@ -7,6 +7,8 @@
 
 ## Architecture boundaries
 
+- Waing is a desktop application built with Electron.
+- All UI/UX, interaction patterns, navigation, and screen flows must follow desktop application design conventions.
 - Provider-specific protocol types stay inside their adapter package.
 - Renderer code communicates with privileged code only through the typed preload API in `@waing/ipc-contracts`.
 - The renderer must remain sandboxed, with Node integration disabled and context isolation enabled.

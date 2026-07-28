@@ -1,4 +1,4 @@
-import type { AgentDescriptor, AgentEvent, AgentModelDescriptor, AgentSession, AppConversation, AutoSelection, EffortLevel, ExecutionWorkflowRole, PermissionDecision, Project, RoleExecutionProfile, RoutingDecision, WorkflowEvent } from "@waing/domain";
+import type { AgentDescriptor, AgentEvent, AgentModelDescriptor, AgentSession, AppConversation, AutoSelection, EffortLevel, ExecutionWorkflowRole, PermissionDecision, Project, RoleExecutionProfile, RoutingDecision, StepAnnouncement, WorkflowEvent } from "@waing/domain";
 import { roleExecutionProfileSchema } from "@waing/domain";
 import { z } from "zod";
 
@@ -19,10 +19,12 @@ export interface ConversationHistory {
   conversation: AppConversation;
   messages: Array<{ role: "user" | "assistant" | "system" | "activity"; content: string; createdAt: string }>;
   events: AgentEvent[];
+  announcements: StepAnnouncement[];
 }
 export const agentModelsInputSchema = z.object({ agentId: z.string().min(1) });
 export const openLinkInputSchema = z.object({ target: z.string().min(1).max(4_096), projectId: z.string().min(1).optional() }).strict();
 export const sessionSendInputSchema = z.object({ projectId: z.string().min(1), text: z.string().min(1),
+  conversationId: z.string().min(1).optional(),
   attachmentIds: z.array(z.string().uuid()).max(10).optional(),
   agentId: z.string().min(1), model: z.string().min(1).optional(), mode: z.enum(["execute", "plan", "review", "investigate"]),
   effort: z.enum(["low", "medium", "high", "max"]).optional() });
@@ -47,8 +49,21 @@ export const roleProfilesInputSchema = z.object({ profiles: z.array(roleExecutio
 export interface RoleProfilesView { profiles: RoleExecutionProfile[]; needsReview: boolean }
 
 /** Main-process context added to every workflow event so concurrent runs can be isolated in the renderer. */
-export type DesktopWorkflowEvent = WorkflowEvent & { workflowRunId: string; projectId: string };
-export interface AttachmentChoice { id: string; name: string; mimeType: string; kind: "image" | "file" }
+export type DesktopWorkflowEvent = WorkflowEvent & { workflowRunId: string; projectId: string; conversationId: string };
+export const attachmentChoiceSchema = z.object({
+  id: z.string().uuid(), name: z.string().min(1).max(255), mimeType: z.string().min(1).max(255),
+  kind: z.enum(["image", "file"]),
+}).strict();
+export type AttachmentChoice = z.infer<typeof attachmentChoiceSchema>;
+export const attachmentsAddInputSchema = z.object({ files: z.array(z.object({
+  name: z.string().min(1).max(255), mimeType: z.string().min(1).max(255),
+  bytes: z.instanceof(Uint8Array).refine((bytes) => bytes.byteLength > 0 && bytes.byteLength <= 20 * 1024 * 1024,
+    "Attachments must be between 1 byte and 20 MB"),
+}).strict()).min(1).max(10) }).strict().refine(
+  ({ files }) => files.reduce((total, file) => total + file.bytes.byteLength, 0) <= 50 * 1024 * 1024,
+  "Attachments may total at most 50 MB",
+);
+export type AttachmentUpload = z.infer<typeof attachmentsAddInputSchema>["files"][number];
 
 export interface AppInfo {
   name: string;
@@ -61,6 +76,7 @@ export interface DesktopApi {
   projects: {
     choose(): Promise<Project | null>;
     list(): Promise<Project[]>;
+    reveal(projectId: string): Promise<void>;
     remove(projectId: string): Promise<Project[]>;
   };
   conversations: {
@@ -73,7 +89,10 @@ export interface DesktopApi {
     refresh(): Promise<AgentDescriptor[]>;
     models(agentId: string): Promise<AgentModelDescriptor[]>;
   };
-  attachments: { choose(): Promise<AttachmentChoice[]> };
+  attachments: {
+    choose(): Promise<AttachmentChoice[]>;
+    add(files: AttachmentUpload[]): Promise<AttachmentChoice[]>;
+  };
   system: { openLink(target: string, projectId?: string): Promise<void> };
   sessions: {
     send(input: z.infer<typeof sessionSendInputSchema>): Promise<SessionSendResult>;

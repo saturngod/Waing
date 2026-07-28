@@ -12,15 +12,51 @@ test("launches a sandboxed renderer with the typed preload bridge", async () => 
     await expect(page.getByRole("heading", { name: "Waing" })).toBeVisible();
     await expect(page.getByTestId("version")).toContainText("v0.1.0");
     await expect(page.getByText("Projects", { exact: true })).toBeVisible();
-    await expect(page.getByRole("button", { name: "E2E Workspace" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "E2E Workspace", exact: true })).toBeVisible();
     await expect(page.getByText("No tasks yet", { exact: true })).toBeVisible();
     await page.getByRole("button", { name: "Hide sidebar" }).click();
     await expect(page.locator(".context-sidebar")).toHaveCount(0);
     await page.getByRole("button", { name: "Show sidebar" }).click();
     await expect(page.locator(".context-sidebar")).toBeVisible();
+    const workspaceWidthWithRightSidebar = await page.locator(".workspace").evaluate((node) => node.getBoundingClientRect().width);
+    const rightSidebarWidth = await page.locator(".inspector").evaluate((node) => node.getBoundingClientRect().width);
+    await page.getByRole("button", { name: "Hide right sidebar" }).click();
+    await expect(page.locator(".inspector")).toHaveCount(0);
+    await expect(page.locator(".workspace")).toHaveJSProperty("clientWidth", workspaceWidthWithRightSidebar + rightSidebarWidth);
+    await page.getByRole("button", { name: "Show right sidebar" }).click();
+    await expect(page.locator(".inspector")).toBeVisible();
+    await expect(page.locator(".project-actions")).toHaveCount(0);
+    await page.getByRole("button", { name: "E2E Workspace", exact: true }).click({ button: "right" });
+    await expect(page.getByRole("menu", { name: "Project actions" })).toBeVisible();
+    await page.locator(".menu-backdrop").click({ position: { x: 1, y: 1 } });
+    await page.locator(".project-row-wrap").hover();
+    await page.getByRole("button", { name: "Project actions for E2E Workspace" }).click();
+    const projectMenu = page.getByRole("menu", { name: "Project actions" });
+    await expect(projectMenu.getByRole("menuitem")).toHaveCount(3);
+    await expect(projectMenu.getByRole("menuitem", { name: "New chat" })).toBeVisible();
+    await expect(projectMenu.getByRole("menuitem", { name: "Reveal in Finder" })).toBeVisible();
+    await expect(projectMenu.getByRole("menuitem", { name: "Remove" })).toBeVisible();
+    await projectMenu.getByRole("menuitem", { name: "New chat" }).click();
+    await expect(page.getByLabel("Message")).toBeFocused();
     await page.getByRole("button", { name: "New task" }).click();
     await expect(page.getByLabel("Message")).toBeFocused();
     await expect(page.getByRole("button", { name: "Attach files and images" })).toBeVisible();
+    await page.getByLabel("Message").evaluate((textarea) => {
+      const transfer = new DataTransfer();
+      transfer.items.add(new File([new Uint8Array([137, 80, 78, 71])], "clipboard.png", { type: "image/png" }));
+      textarea.dispatchEvent(new ClipboardEvent("paste", { clipboardData: transfer, bubbles: true, cancelable: true }));
+    });
+    await expect(page.getByRole("list", { name: "Attached files" })).toContainText("clipboard.png");
+    await page.locator(".composer").evaluate((composer) => {
+      const transfer = new DataTransfer();
+      transfer.items.add(new File([new Uint8Array([255, 216, 255])], "dropped.jpg", { type: "image/jpeg" }));
+      composer.dispatchEvent(new DragEvent("dragenter", { dataTransfer: transfer, bubbles: true, cancelable: true }));
+      composer.dispatchEvent(new DragEvent("drop", { dataTransfer: transfer, bubbles: true, cancelable: true }));
+    });
+    await expect(page.getByRole("list", { name: "Attached files" })).toContainText("dropped.jpg");
+    await page.getByRole("button", { name: "Remove clipboard.png" }).click();
+    await page.getByRole("button", { name: "Remove dropped.jpg" }).click();
+    await expect(page.getByRole("list", { name: "Attached files" })).toHaveCount(0);
     expect(await page.getByLabel("Message").evaluate((node) => getComputedStyle(node).fontFamily))
       .toBe(await page.locator("body").evaluate((node) => getComputedStyle(node).fontFamily));
     expect(await page.evaluate(() => typeof window.waing.app.info)).toBe("function");
@@ -51,6 +87,10 @@ test("launches a sandboxed renderer with the typed preload bridge", async () => 
     await expect(routingCard).toContainText("92%");
     await page.getByRole("button", { name: "Send ↵" }).click();
     await expect(page.getByRole("region", { name: "Permission request" })).toBeVisible();
+    await expect(page.getByTestId("last-event")).toBeHidden();
+    await expect(page.getByRole("button", { name: "Deny" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Allow once" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Allow for session" })).toBeVisible();
     await expect(page.locator(".activity-group.pending .activity-spinner")).toBeVisible();
     await expect(page.getByRole("status", { name: "Agent is working" })).toBeVisible();
     await expect(page.locator(".activity-group[open]")).toHaveCount(0);
@@ -61,6 +101,8 @@ test("launches a sandboxed renderer with the typed preload bridge", async () => 
     expect(await page.locator('img[src="x"]').count()).toBe(0);
     expect(await page.evaluate(() => (window as unknown as { __waingXss?: boolean }).__waingXss)).toBeUndefined();
     const markdown = page.locator(".chat-turn.agent .markdown");
+    await expect(page.locator(".chat-turn.agent .chat-author").first()).toContainText("Model: fake-1");
+    await expect(page.locator(".chat-turn.agent .chat-author").first()).toContainText("Effort:");
     await expect(markdown.locator("table th").first()).toHaveText("Case");
     await expect(markdown.locator("table code")).toHaveText("./images/hello.png");
     await expect(markdown.locator("li strong")).toHaveText("bold");
@@ -71,9 +113,35 @@ test("launches a sandboxed renderer with the typed preload bridge", async () => 
     const conversation = page.locator(".conversation-list button").first();
     await expect(conversation).toBeVisible();
     await expect(conversation).toContainText("Add a searchable project dashboard");
+    const sidebarAlignment = await page.evaluate(() => {
+      const projectRow = document.querySelector<HTMLElement>(".project-row")!;
+      const projectName = projectRow.querySelector<HTMLElement>("strong")!;
+      const taskRow = document.querySelector<HTMLElement>(".conversation-list button")!;
+      const taskName = taskRow.querySelector<HTMLElement>("span")!;
+      return { projectLeft: projectRow.getBoundingClientRect().left, taskLeft: taskRow.getBoundingClientRect().left,
+        projectTextLeft: projectName.getBoundingClientRect().left, taskTextLeft: taskName.getBoundingClientRect().left,
+        projectBackground: getComputedStyle(projectRow).backgroundColor };
+    });
+    expect(Math.abs(sidebarAlignment.projectLeft - sidebarAlignment.taskLeft)).toBeLessThan(1);
+    expect(Math.abs(sidebarAlignment.projectTextLeft - sidebarAlignment.taskTextLeft)).toBeLessThan(1);
+    expect(sidebarAlignment.projectBackground).toBe("rgba(0, 0, 0, 0)");
     await conversation.click();
+    await expect(conversation).toHaveClass(/active/);
+    expect(await conversation.evaluate((node) => getComputedStyle(node).backgroundColor)).not.toBe(sidebarAlignment.projectBackground);
     await expect(page.getByRole("region", { name: "Conversation" })).toContainText("Add a searchable project dashboard");
+    // Sending from an open history item continues that app conversation instead of adding another sidebar row.
+    await page.getByLabel("Message").fill("Continue from that plan");
+    await page.getByRole("button", { name: "Send ↵" }).click();
+    await expect(page.locator(".conversation-list button")).toHaveCount(1);
+    await expect(page.getByRole("region", { name: "Permission request" })).toBeVisible();
+    await page.getByRole("button", { name: "Allow once" }).click();
+    await expect(page.getByTestId("last-event")).toHaveText("run.completed");
+    await expect(page.locator(".conversation-list button")).toHaveCount(1);
+    await expect(page.getByRole("region", { name: "Conversation" })).toContainText("Continue from that plan");
     await conversation.click({ button: "right" });
+    const conversationMenu = page.getByRole("menu", { name: "Conversation actions" });
+    await expect(conversationMenu.getByRole("menuitem")).toHaveCount(2);
+    await expect(conversationMenu.getByRole("menuitem", { name: "Reveal in Finder" })).toBeVisible();
     await page.getByRole("menuitem", { name: "Delete conversation" }).click();
     await expect(page.locator(".conversation-list button")).toHaveCount(0);
     await page.getByRole("button", { name: "Settings" }).click();

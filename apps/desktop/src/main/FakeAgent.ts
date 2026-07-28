@@ -24,7 +24,7 @@ export class FakeAgent implements CodingAgent {
     return Promise.resolve({ id: this.id, displayName: "Fake Agent", installed: true, available: true,
       version: "1.0.0", capabilities, authState: "ready", warnings: [] });
   }
-  listModels() { return Promise.resolve([{ agentId: this.id, modelId: "fake-1", displayName: "Fake 1", available: true }]); }
+  listModels() { return Promise.resolve([{ agentId: this.id, modelId: "fake-1", displayName: "Fake 1", available: true, isDefault: true }]); }
   startSession(input: StartSessionInput): Promise<AgentSession> {
     const now = new Date().toISOString();
     const session: AgentSession = { id: randomUUID(), conversationId: input.conversationId,
