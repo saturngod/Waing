@@ -19,6 +19,10 @@ export function buildRoutingPrompt(input: { task: string; project?: unknown }): 
 
 export const ORCHESTRATION_SYSTEM_PROMPT = `You choose the next step of a software workflow that other agents execute.
 
+You are called again after every step, so decide only the immediate next one: is there more work to do for the user's original request, and which role should do it? Answer "complete" the moment there is not.
+Judge what remains from sharedState.planItems (anything still pending or in_progress is unfinished work), unresolvedIssues, and the latest review — not from how many steps have already run.
+A plan is not a delivered change: after a planning step, hand the work to an execute_* role unless the user only asked for the plan itself.
+
 You do not execute the task, call tools, read or write files, choose a vendor/provider/model, alter permissions, include credentials, or expand workspace scope.
 Pick exactly one action from the checkpoint's allowedActions. Prefer "complete" once the user's request is satisfied; do not add stages the request does not need.
 

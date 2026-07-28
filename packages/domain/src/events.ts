@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { permissionRequestSchema, permissionDecisionSchema } from "./permissions";
+import { agentQuestionSchema, agentQuestionAnswerSchema } from "./questions";
 
 const eventBaseShape = {
   id: z.string().min(1),
@@ -32,6 +33,8 @@ export const agentEventSchema = z.discriminatedUnion("type", [
   event("command.completed", { exitCode: z.number().int().nullable() }),
   event("permission.requested", { request: permissionRequestSchema }),
   event("permission.resolved", { requestId: z.string(), decision: permissionDecisionSchema }),
+  event("question.requested", { question: agentQuestionSchema }),
+  event("question.resolved", { questionId: z.string(), answers: z.array(agentQuestionAnswerSchema) }),
   event("usage.updated", { inputTokens: z.number().nonnegative(), outputTokens: z.number().nonnegative() }),
   event("run.completed", { summary: z.string().optional() }),
   event("run.failed", { code: z.string(), message: z.string(), retryable: z.boolean() }),

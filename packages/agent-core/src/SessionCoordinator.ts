@@ -1,14 +1,20 @@
 import { AgentError } from "@waing/domain";
 import type { AgentSession, AgentSessionStatus } from "@waing/domain";
 
+/**
+ * Self-transitions are always legal: providers request several approvals at once (two tool calls in one
+ * assistant message, or a question raised while another approval is parked), so waiting_permission is
+ * entered again before it is left. A run can also finish while a request is still outstanding — the provider
+ * ends the turn and the pending request is released — so waiting_permission reaches the terminal states too.
+ */
 const allowedTransitions: Record<AgentSessionStatus, ReadonlySet<AgentSessionStatus>> = {
-  idle: new Set(["starting", "running", "completed", "failed"]),
-  starting: new Set(["idle", "running", "failed"]),
-  running: new Set(["waiting_permission", "cancelling", "completed", "failed"]),
-  waiting_permission: new Set(["running", "cancelling", "failed"]),
-  cancelling: new Set(["completed", "failed"]),
-  completed: new Set(["starting", "running"]),
-  failed: new Set(["starting", "running"]),
+  idle: new Set(["idle", "starting", "running", "completed", "failed"]),
+  starting: new Set(["starting", "idle", "running", "failed"]),
+  running: new Set(["running", "waiting_permission", "cancelling", "completed", "failed"]),
+  waiting_permission: new Set(["waiting_permission", "running", "cancelling", "completed", "failed"]),
+  cancelling: new Set(["cancelling", "completed", "failed"]),
+  completed: new Set(["completed", "starting", "running"]),
+  failed: new Set(["failed", "starting", "running"]),
 };
 
 export class SessionCoordinator {

@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { AgentManager } from "@waing/agent-core";
 import {
-  AgentError, reviewResultSchema, workflowHandoffPacketSchema, workflowSharedStateUpdateSchema, workflowStepResultSchema,
+  AgentError, resolvePermissionProfile, reviewResultSchema, workflowHandoffPacketSchema,
+  workflowSharedStateUpdateSchema, workflowStepResultSchema,
 } from "@waing/domain";
 import type {
   AgentEvent, AgentRequest, AgentSession, DocumentTaskInput, FixPacket, RoleExecutionProfile, StepAnnouncementIntent, WorkflowContext,
@@ -86,16 +87,19 @@ export class AgentStepExecutor implements WorkflowStepExecutor {
   private async openSession(input: StepExecutionInput): Promise<AgentSession> {
     const start = { conversationId: input.context.workflowRunId, projectId: input.context.projectId,
       projectRoot: input.context.projectRoot };
+    // The role's saved permission profile travels with the session, so approvals this step raises are answered
+    // by the rule the user set for that role rather than prompting for every one of them.
+    const permissions = resolvePermissionProfile(input.profile.permissionProfileId);
     if (input.resumeProviderSessionId !== undefined) {
       const { capabilities } = await this.agents.registry.get(input.profile.agentId).discover();
       if (capabilities.persistentSessions) {
         try {
           return await this.agents.resumeSession(input.profile.agentId,
-            { ...start, providerSessionId: input.resumeProviderSessionId });
+            { ...start, providerSessionId: input.resumeProviderSessionId }, permissions);
         } catch { /* The provider forgot the session; a fresh one with the full packet is still correct. */ }
       }
     }
-    return this.agents.startSession(input.profile.agentId, start);
+    return this.agents.startSession(input.profile.agentId, start, permissions);
   }
 
   /**
@@ -106,7 +110,7 @@ export class AgentStepExecutor implements WorkflowStepExecutor {
    */
   private async supportedControls(input: StepExecutionInput): Promise<Pick<AgentRequest, "mode" | "model" | "effort">> {
     const { capabilities } = await this.agents.registry.get(input.profile.agentId).discover();
-    const requested = input.profile.mode ?? this.defaultMode(input.node);
+    const requested = this.defaultMode(input.node);
     const mode = requested === "plan" && !capabilities.planMode ? "execute" : requested;
     const model = capabilities.modelSelection ? input.profile.modelId : undefined;
     const effort = capabilities.effortControl ? input.profile.effort : undefined;
@@ -178,10 +182,22 @@ export class AgentStepExecutor implements WorkflowStepExecutor {
   private parseStateUpdate(text: string): { text: string; update?: WorkflowSharedStateUpdate } {
     const pattern = new RegExp(`\`\`\`${STATE_FENCE}\\s*([\\s\\S]*?)\`\`\``, "gu");
     const matches = [...text.matchAll(pattern)];
-    if (matches.length === 0) return { text };
+    if (matches.length === 0) return this.parseBareStateUpdate(text);
     const stripped = text.replace(pattern, "").trim();
     const parsed = workflowSharedStateUpdateSchema.safeParse(this.json(matches.at(-1)?.[1] ?? ""));
     return parsed.success ? { text: stripped, update: parsed.data } : { text: stripped };
+  }
+
+  /**
+   * Providers drop the fence often enough that the block would otherwise be read as prose and shown to the user as a
+   * wall of JSON. A bare object is only taken when it parses as a state update and nothing but whitespace follows it.
+   */
+  private parseBareStateUpdate(text: string): { text: string; update?: WorkflowSharedStateUpdate } {
+    const start = text.search(/\{\s*"(?:planItems|decisions|openQuestions)"/u);
+    if (start < 0 || text.slice(start).trimEnd().at(-1) !== "}") return { text };
+    const candidate = text.slice(start).trimEnd();
+    const parsed = workflowSharedStateUpdateSchema.safeParse(this.json(candidate));
+    return parsed.success ? { text: text.slice(0, start).trim(), update: parsed.data } : { text };
   }
   private json(value: string): unknown {
     try { return JSON.parse(value) as unknown; } catch { return undefined; }
@@ -192,7 +208,14 @@ export class AgentStepExecutor implements WorkflowStepExecutor {
     if (start < 0 || end < start) throw new AgentError("PROTOCOL_ERROR", "Review step did not return structured JSON");
     return reviewResultSchema.parse(JSON.parse(text.slice(start, end + 1)) as unknown);
   }
-  private defaultMode(node: StepExecutionInput["node"]): "execute" | "review" {
-    return node.type === "review_gate" || node.type === "role_task" && node.role === "review" ? "review" : "execute";
+  /**
+   * Mode is the role restated, so it is derived rather than configured: a Review role in Execute mode was a
+   * contradiction the settings grid used to allow. Providers vary in what they honor — only plan mode changes
+   * anything on Claude and Antigravity, and Codex and OpenCode ignore mode entirely — so this stays advisory.
+   */
+  private defaultMode(node: StepExecutionInput["node"]): "execute" | "plan" | "review" {
+    if (node.type === "review_gate" || node.type === "role_task" && node.role === "review") return "review";
+    if (node.type === "role_task" && node.role === "planning") return "plan";
+    return "execute";
   }
 }

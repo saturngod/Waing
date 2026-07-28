@@ -1,10 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { CornerDownLeft, FileText, Folder, FolderOpen, Image, MoreHorizontal, PanelLeft, PanelRight,
+import { Check, Clock, CornerDownLeft, FileText, Folder, FolderOpen, Image, MoreHorizontal, PanelLeft, PanelRight,
   Paperclip, Plus, Settings, SquarePen, Trash2, X } from "lucide-react";
 import type { AppInfo, AttachmentChoice, ConversationHistory, SessionSendResult } from "@waing/ipc-contracts";
-import type { AgentDescriptor, AgentEvent, AppConversation, PermissionRequest, Project, StepAnnouncement } from "@waing/domain";
+import type { AgentDescriptor, AgentEvent, AgentQuestion, AgentQuestionResponse, AppConversation, PermissionRequest,
+  Project, StepAnnouncement, WorkflowSharedState } from "@waing/domain";
 import { ActivityTimeline } from "./ActivityTimeline";
 import type { TimelineStep } from "./ActivityTimeline";
+import { FileMentionList, useFileMentions } from "./FileMentions";
+import { QuestionCard } from "./QuestionCard";
 import { SettingsPanel } from "./SettingsPanel";
 import { PROVIDER_DOT_TITLES, providerDotState } from "./providerStatus";
 
@@ -23,6 +26,8 @@ const tokenFormat = new Intl.NumberFormat(undefined, { notation: "compact", maxi
 const compactTokens = (value: number): string => tokenFormat.format(value);
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 type HistoryMessage = { id: string; role: "user" | "assistant"; content: string };
+/** A composed message with nowhere to run yet: either sent immediately, or held until the project's run ends. */
+type QueuedMessage = { id: string; text: string; attachments: AttachmentChoice[] };
 
 function visibleHistoryMessages(messages: ConversationHistory["messages"]): HistoryMessage[] {
   return messages.flatMap((message, index) => message.role === "user" || message.role === "assistant"
@@ -46,14 +51,18 @@ export function App() {
   const [runningProjectIds, setRunningProjectIds] = useState<Set<string>>(() => new Set());
   const [activeRunByProject, setActiveRunByProject] = useState<Record<string, string>>({});
   const [permissionsByProject, setPermissionsByProject] = useState<Record<string, PermissionRequest>>({});
+  const [activeStepByProject, setActiveStepByProject] = useState<Record<string, StepAnnouncement>>({});
   const [error, setError] = useState<string>();
   const [permission, setPermission] = useState<PermissionRequest>();
+  const [questionsByProject, setQuestionsByProject] = useState<Record<string, AgentQuestion>>({});
+  const [question, setQuestion] = useState<AgentQuestion>();
   const [lastEvent, setLastEvent] = useState<AgentEvent["type"]>();
   const [events, setEvents] = useState<AgentEvent[]>([]);
   const [agents, setAgents] = useState<AgentDescriptor[]>([]);
   const [task, setTask] = useState("");
   const [attachments, setAttachments] = useState<AttachmentChoice[]>([]);
   const [attachmentDragActive, setAttachmentDragActive] = useState(false);
+  const [queuedByProject, setQueuedByProject] = useState<Record<string, QueuedMessage[]>>({});
   const [prompt, setPrompt] = useState<string>();
   const [activeSessionId, setActiveSessionId] = useState<string>();
   const [resolvedAgentId, setResolvedAgentId] = useState<string>();
@@ -64,6 +73,8 @@ export function App() {
   const [workflowSteps, setWorkflowSteps] = useState<TimelineStep[]>([]);
   const [agentMeta, setAgentMeta] = useState<Record<string, string>>({});
   const [activeStep, setActiveStep] = useState<StepAnnouncement>();
+  // Each project keeps its own plan: a run started while the user was elsewhere must still show its plan on return.
+  const [sharedStateByProject, setSharedStateByProject] = useState<Record<string, WorkflowSharedState>>({});
   const [openConversationId, setOpenConversationId] = useState<string>();
   const [historyMessages, setHistoryMessages] = useState<HistoryMessage[]>([]);
   const [replayText, setReplayText] = useState<string>();
@@ -79,6 +90,8 @@ export function App() {
   const workflowProjectRef = useRef(new Map<string, string>());
   const pendingTaskTitleRef = useRef(new Map<string, string>());
   const sendBusy = project !== null && runningProjectIds.has(project.id);
+  const composerDraft = task.trim().length > 0 || attachments.length > 0;
+  const queued = project === null ? [] : queuedByProject[project.id] ?? [];
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -111,6 +124,10 @@ export function App() {
             setPermissionsByProject((current) => ({ ...current, [eventProjectId]: event.request }));
           } else if (event.type === "permission.resolved") {
             setPermissionsByProject((current) => { const next = { ...current }; delete next[eventProjectId]; return next; });
+          } else if (event.type === "question.requested") {
+            setQuestionsByProject((current) => ({ ...current, [eventProjectId]: event.question }));
+          } else if (event.type === "question.resolved") {
+            setQuestionsByProject((current) => { const next = { ...current }; delete next[eventProjectId]; return next; });
           }
           if (eventProjectId !== selectedProjectIdRef.current) return;
         }
@@ -119,11 +136,14 @@ export function App() {
       setEvents((current) => [...current, event]);
       if (event.type === "permission.requested") setPermission(event.request);
       if (event.type === "permission.resolved") setPermission(undefined);
+      if (event.type === "question.requested") setQuestion(event.question);
+      if (event.type === "question.resolved") setQuestion(undefined);
       // A workflow keeps running past a single step's terminal event, so only its own events clear the busy state.
     });
     const unsubscribeWorkflow = window.waing.workflows.onEvent((event) => {
       workflowProjectRef.current.set(event.workflowRunId, event.projectId);
       if (event.type === "workflow.started") {
+        setSharedStateByProject((current) => { const next = { ...current }; delete next[event.projectId]; return next; });
         setRunningProjectIds((current) => new Set(current).add(event.projectId));
         setActiveRunByProject((current) => ({ ...current, [event.projectId]: event.workflowRunId }));
         const now = new Date().toISOString();
@@ -135,6 +155,19 @@ export function App() {
           setConversations((current) => [runningConversation, ...current.filter((item) => item.id !== event.conversationId)]);
           setActiveSessionId(event.workflowRunId); setOpenConversationId(event.conversationId); setRouterStep("idle");
         }
+      }
+      // The inspector reads the running step, so every project keeps its own: coming back to a run started while the
+      // user was elsewhere must show that step's provider and model instead of falling back to "Auto".
+      if (event.type === "workflow.step.announced") {
+        setActiveStepByProject((current) => ({ ...current, [event.projectId]: event.announcement }));
+      }
+      // Plan, decisions, and open questions belong to the run, not to a step, so they survive every step boundary.
+      if (event.type === "workflow.state.updated") {
+        setSharedStateByProject((current) => ({ ...current, [event.projectId]: event.sharedState }));
+      }
+      if (event.type === "workflow.completed" || event.type === "workflow.failed" || event.type === "workflow.cancelled"
+        || event.type === "workflow.paused") {
+        setActiveStepByProject((current) => { const next = { ...current }; delete next[event.projectId]; return next; });
       }
       const selected = event.projectId === selectedProjectIdRef.current;
       if (!selected) {
@@ -183,6 +216,10 @@ export function App() {
       }
       if (event.type === "workflow.completed" || event.type === "workflow.failed" || event.type === "workflow.cancelled"
         || event.type === "workflow.paused") {
+        // The engine only publishes node.completed for a step that succeeded, so a failed or cancelled step leaves
+        // its announcement pending forever — and the transcript keeps spinning "Working" long after the run ended.
+        setWorkflowSteps((current) => current.map((step) => step.state !== "pending" ? step
+          : { ...step, state: event.type === "workflow.completed" ? "done" : "failed" }));
         setRunningProjectIds((current) => { const next = new Set(current); next.delete(event.projectId); return next; });
         setActiveRunByProject((current) => { const next = { ...current }; delete next[event.projectId]; return next; });
         setActiveStep(undefined);
@@ -203,7 +240,20 @@ export function App() {
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  const mentions = useFileMentions(project?.id, composerRef, setTask);
   const followRef = useRef(true);
+  const runTaskRef = useRef<(target: Project, message: QueuedMessage) => Promise<void>>(null);
+
+  // A queued message runs the moment its project goes idle. Only the selected project drains, because a run
+  // writes into the transcript the user is looking at; a background project keeps its queue until reopened.
+  useEffect(() => {
+    if (project === null || sendBusy) return;
+    const [next] = queuedByProject[project.id] ?? [];
+    if (next === undefined) return;
+    setQueuedByProject((current) => ({ ...current,
+      [project.id]: (current[project.id] ?? []).filter((item) => item.id !== next.id) }));
+    void runTaskRef.current?.(project, next);
+  }, [project, sendBusy, queuedByProject]);
 
   // Streaming appends to the bottom of the transcript, so follow it unless the user scrolled away.
   useEffect(() => {
@@ -212,6 +262,7 @@ export function App() {
   }, [events, prompt]);
 
   const selectedAgent = agents.find((agent) => agent.id === resolvedAgentId);
+  const sharedState = project === null ? undefined : sharedStateByProject[project.id];
   const latestDiff = useMemo(() => [...events].reverse().find((event) => event.type === "diff.updated"), [events]);
   // Totals are cumulative within a session, so only each session's newest tick counts — one session per workflow step.
   const usage = useMemo(() => {
@@ -249,6 +300,8 @@ export function App() {
     setActiveSessionId(activeRunByProject[nextProject.id]);
     setOpenConversationId(activeRunByProject[nextProject.id]);
     setPermission(permissionsByProject[nextProject.id]);
+    setQuestion(questionsByProject[nextProject.id]);
+    setActiveStep(activeStepByProject[nextProject.id]);
     setProject(nextProject);
   }
 
@@ -276,6 +329,7 @@ export function App() {
     if (target === null) return;
     setProjectMenuFor(undefined); setConfirmingRemoval(undefined);
     if (target.id !== project?.id) selectProject(target);
+    setSharedStateByProject((current) => { const next = { ...current }; delete next[target.id]; return next; });
     clearTranscript(); setReplayText(undefined); setTask(""); setAttachments([]); setError(undefined);
     window.requestAnimationFrame(() => composerRef.current?.focus());
   }
@@ -331,6 +385,13 @@ export function App() {
     } catch (reason) { setConfirmingRemoval(undefined); reportError(reason); }
   }
 
+  async function answerQuestion(answers: AgentQuestionResponse): Promise<void> {
+    if (question === undefined) return;
+    // The card closes on the provider's question.resolved event, so a failed response keeps it on screen.
+    try { await window.waing.questions.respond(question.sessionId, question.id, answers); }
+    catch (reason) { reportError(reason); }
+  }
+
   async function answerPermission(decision: "allow_once" | "allow_session" | "deny"): Promise<void> {
     if (permission === undefined) return;
     try {
@@ -340,7 +401,7 @@ export function App() {
 
   function clearTranscript(): void {
     setEvents([]); setPrompt(undefined); setWorkflowSteps([]); setAgentMeta({}); setActiveStep(undefined);
-    setRoutedBy(undefined); setPermission(undefined); setResolvedAgentId(undefined);
+    setRoutedBy(undefined); setPermission(undefined); setQuestion(undefined); setResolvedAgentId(undefined);
     setResolvedModel(undefined); setResolvedEffort(undefined); setActiveSessionId(undefined); setOpenConversationId(undefined);
     setHistoryMessages([]);
   }
@@ -351,6 +412,8 @@ export function App() {
     try {
       const history = await window.waing.conversations.history(conversationId);
       clearTranscript();
+      // The plan belongs to the run that produced it; a replayed conversation carries no state events to rebuild one.
+      if (project !== null) setSharedStateByProject((current) => { const next = { ...current }; delete next[project.id]; return next; });
       setOpenConversationId(conversationId);
       setHistoryMessages(visibleHistoryMessages(history.messages));
       const replay = history.events.filter((event) => event.type !== "permission.requested"
@@ -375,10 +438,24 @@ export function App() {
     } catch (reason) { reportError(reason); }
   }
 
+  /** Send now when the project is idle; otherwise hold the message and let the run that owns the project finish. */
   async function sendTask(): Promise<void> {
-    if (project === null || (task.trim().length === 0 && attachments.length === 0)) return;
-    const text = task.trim().length === 0 ? "Please review the attached files." : task.trim();
-    const selectedAttachments = attachments;
+    if (project === null || !composerDraft) return;
+    const message: QueuedMessage = { id: crypto.randomUUID(), text: task.trim(), attachments };
+    setTask(""); setAttachments([]);
+    if (runningProjectIds.has(project.id)) {
+      setQueuedByProject((current) => ({ ...current, [project.id]: [...(current[project.id] ?? []), message] }));
+      return;
+    }
+    await runTask(project, message);
+  }
+
+  // The drain effect reaches the current closure through a ref, so it never restarts on every render.
+  runTaskRef.current = runTask;
+
+  async function runTask(target: Project, message: QueuedMessage): Promise<void> {
+    const text = message.text.length === 0 ? "Please review the attached files." : message.text;
+    const selectedAttachments = message.attachments;
     const continuingConversationId = openConversationId;
     if (continuingConversationId !== undefined) {
       try {
@@ -386,18 +463,18 @@ export function App() {
         setHistoryMessages(visibleHistoryMessages(history.messages));
       } catch (reason) { reportError(reason); return; }
     }
-    setError(undefined); setEvents([]); setPermission(undefined);
-    setRunningProjectIds((current) => new Set(current).add(project.id));
-    pendingTaskTitleRef.current.set(project.id,
+    setError(undefined); setEvents([]); setPermission(undefined); setQuestion(undefined);
+    setRunningProjectIds((current) => new Set(current).add(target.id));
+    pendingTaskTitleRef.current.set(target.id,
       conversations.find((conversation) => conversation.id === continuingConversationId)?.title ?? text.slice(0, 80));
-    setPrompt(text); setTask(""); setAttachments([]); setRoutedBy(undefined); setResolvedAgentId(undefined);
+    setPrompt(text); setRoutedBy(undefined); setResolvedAgentId(undefined);
     setResolvedModel(undefined); setResolvedEffort(undefined);
     setWorkflowSteps([]); setAgentMeta({}); setActiveStep(undefined); setActiveSessionId(undefined);
     // Routing happens inside the send call, so the step is shown as running until the reply names the routed role.
     setRouterStep("running");
     try {
       // Always Auto: the router picks the role, and that role's saved profile supplies provider, model, and effort.
-      const result = await window.waing.sessions.send({ projectId: project.id, text, agentId: "auto", mode: "execute",
+      const result = await window.waing.sessions.send({ projectId: target.id, text, agentId: "auto", mode: "execute",
         ...(continuingConversationId === undefined ? {} : { conversationId: continuingConversationId }),
         ...(selectedAttachments.length === 0 ? {} : { attachmentIds: selectedAttachments.map((item) => item.id) }) });
       if (result.session !== undefined) setActiveSessionId(result.session.id);
@@ -407,22 +484,31 @@ export function App() {
       setOpenConversationId(result.conversation.id);
       // A workflow reports its own terminal event; a single agent run is already finished when send resolves.
       if (result.workflowRunId === undefined) {
-        setRunningProjectIds((current) => { const next = new Set(current); next.delete(project.id); return next; });
+        setRunningProjectIds((current) => { const next = new Set(current); next.delete(target.id); return next; });
       }
-      pendingTaskTitleRef.current.delete(project.id);
+      pendingTaskTitleRef.current.delete(target.id);
       setConversations((current) => [result.conversation, ...current.filter((item) => item.id !== result.conversation.id)]);
       setConversationsByProject((current) => ({ ...current,
-        [project.id]: [result.conversation, ...(current[project.id] ?? []).filter((item) => item.id !== result.conversation.id)] }));
+        [target.id]: [result.conversation, ...(current[target.id] ?? []).filter((item) => item.id !== result.conversation.id)] }));
     } catch (reason) {
-      setRunningProjectIds((current) => { const next = new Set(current); next.delete(project.id); return next; });
-      pendingTaskTitleRef.current.delete(project.id);
-      setPrompt(undefined); setTask(text); setAttachments(selectedAttachments);
+      setRunningProjectIds((current) => { const next = new Set(current); next.delete(target.id); return next; });
+      pendingTaskTitleRef.current.delete(target.id);
+      setPrompt(undefined); setTask(message.text); setAttachments(selectedAttachments);
       setRouterStep((current) => current === "running" ? "failed" : "idle");
       reportError(reason);
     }
   }
 
+  /** Stop halts the whole thread of work, so anything still queued returns to the composer instead of
+   * starting a run the user just asked to end. */
   async function cancelRun(): Promise<void> {
+    if (project !== null && queued.length > 0) {
+      setQueuedByProject((current) => ({ ...current, [project.id]: [] }));
+      setTask((current) => [...queued.map((item) => item.text), current]
+        .filter((value) => value.trim().length > 0).join("\n\n"));
+      setAttachments((current) => [...queued.flatMap((item) => item.attachments), ...current]
+        .filter((item, index, all) => all.findIndex((other) => other.id === item.id) === index).slice(0, 10));
+    }
     if (activeSessionId === undefined) return;
     try { await window.waing.sessions.cancel(activeSessionId); }
     catch (reason) { reportError(reason); }
@@ -523,7 +609,12 @@ export function App() {
               <span className="run-pill waiting">Permission needed · {permission.title}</span>
               <button className="primary" type="button" onClick={() => setView("chat")}>Review</button>
             </>}
-            {permission === undefined && sendBusy && <>
+            {permission === undefined && question !== undefined && <>
+              {/* The question card is a chat-view element too, so Settings only reports that one is waiting. */}
+              <span className="run-pill waiting">Question · {question.questions[0]?.header ?? "waiting"}</span>
+              <button className="primary" type="button" onClick={() => setView("chat")}>Answer</button>
+            </>}
+            {permission === undefined && question === undefined && sendBusy && <>
               <span className="run-pill"><span className="provider-dot busy" />{activeStep?.message ?? "Task running"}</span>
               <button className="stop" type="button" onClick={() => void cancelRun()}>Stop</button>
               <button type="button" onClick={() => setView("chat")}>Open chat</button>
@@ -554,6 +645,8 @@ export function App() {
               {...(project === null ? {} : { projectId: project.id })} {...(prompt === undefined ? {} : { prompt })}
               {...(replayText === undefined || replayText.length === 0 ? {} : { replayText })}
               {...(modelLabel === undefined ? {} : { model: modelLabel })} {...(effortLabel === undefined ? {} : { effort: effortLabel })} />
+              {question !== undefined && <QuestionCard key={question.id} question={question}
+                onAnswer={(answers) => void answerQuestion(answers)} onDismiss={() => void answerQuestion([])} />}
               {permission !== undefined && <section className={`permission-card ${permission.risk}`} aria-label="Permission request">
                 <div className="permission-heading"><span className={`risk ${permission.risk}`}>{permission.risk} risk</span><span>{permission.agentId}</span></div>
                 <h3>{permission.title}</h3><p>{permission.detail}</p>
@@ -570,25 +663,45 @@ export function App() {
           {lastEvent !== undefined && <output className="event-probe" data-testid="last-event">{lastEvent}</output>}
         </div>
         {view === "chat" && <div className="composer-wrap">
+          {/* Outside .composer because that box clips its overflow, which would cut the popover in half. */}
+          <FileMentionList mentions={mentions} />
           <div className={`composer${attachmentDragActive ? " attachment-drag-active" : ""}`}
             onDragEnter={(event) => { if (event.dataTransfer.types.includes("Files")) { event.preventDefault(); setAttachmentDragActive(true); } }}
             onDragOver={(event) => { if (event.dataTransfer.types.includes("Files")) { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; } }}
             onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setAttachmentDragActive(false); }}
             onDrop={(event) => { event.preventDefault(); setAttachmentDragActive(false); void addAttachmentFiles([...event.dataTransfer.files]); }}>
+            {project !== null && queued.length > 0 && <ul className="composer-queue" aria-label="Queued messages">
+            {queued.map((item, index) => <li key={item.id}><Clock size={14} aria-hidden="true" />
+              <span title={item.text}>{item.text.length === 0 ? "Attached files" : item.text}</span>
+              <button type="button" aria-label={`Remove queued message ${String(index + 1)}`}
+                onClick={() => setQueuedByProject((current) => ({ ...current,
+                  [project.id]: (current[project.id] ?? []).filter((entry) => entry.id !== item.id) }))}><X size={14} /></button></li>)}</ul>}
             {attachments.length > 0 && <ul className="composer-attachments" aria-label="Attached files">
             {attachments.map((attachment) => <li key={attachment.id}>{attachment.kind === "image"
               ? <Image size={15} aria-hidden="true" /> : <FileText size={15} aria-hidden="true" />}
               <span title={attachment.name}>{attachment.name}</span><button type="button" aria-label={`Remove ${attachment.name}`}
                 onClick={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))}><X size={14} /></button></li>)}</ul>}
-            <textarea ref={composerRef} aria-label="Message" value={task} onChange={(event) => setTask(event.target.value)}
-            placeholder="Ask an agent to inspect, explain, or change this project…" rows={3}
+            <textarea ref={composerRef} aria-label="Message" value={task}
+            onChange={(event) => { setTask(event.target.value); mentions.refresh(); }}
+            placeholder="Ask an agent to inspect, explain, or change this project… Type @ to reference a file"
+            rows={3}
             onPaste={(event) => { const files = [...event.clipboardData.files]; if (files.length > 0) { event.preventDefault(); void addAttachmentFiles(files); } }}
-            onKeyDown={(event) => { if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) void sendTask(); }} />
+            onClick={() => mentions.refresh()} onBlur={() => mentions.dismiss()}
+            onKeyUp={(event) => { if (event.key.startsWith("Arrow") || event.key === "Home" || event.key === "End") mentions.refresh(); }}
+            onKeyDown={(event) => {
+              // The picker owns its navigation keys first, so Enter completes a mention instead of adding a newline.
+              if (mentions.handleKeyDown(event)) { event.preventDefault(); return; }
+              if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) void sendTask();
+            }} />
             <div><div className="composer-context"><button className="attach-button" type="button" aria-label="Attach files and images"
               title="Attach files and images" onClick={() => void chooseAttachments()}><Paperclip size={16} /></button>
               <span>{project?.root ?? "Choose a project to begin"}</span></div><div className="composer-actions">
-              {sendBusy ? <button className="stop" type="button" onClick={() => void cancelRun()}>Stop</button> :
-                <button className="send" type="button" disabled={project === null || (task.trim().length === 0 && attachments.length === 0)} onClick={() => void sendTask()}>Send <CornerDownLeft size={14} aria-hidden="true" /></button>}
+              {/* Stop stays reachable for the whole run: queueing a follow-up must never be the reason the user
+                  can no longer halt the work they are watching. Send sits beside it and queues the draft. */}
+              {sendBusy && <button className="stop" type="button" onClick={() => void cancelRun()}>Stop</button>}
+              <button className="send" type="button" disabled={project === null || !composerDraft}
+                title={sendBusy ? "Queued until the running task finishes" : undefined}
+                onClick={() => void sendTask()}>Send <CornerDownLeft size={14} aria-hidden="true" /></button>
             </div></div></div>
         </div>}
       </section>
@@ -601,6 +714,21 @@ export function App() {
           {usage.input + usage.output > 0 && <div><dt>Tokens</dt>
             <dd title={`${usage.input.toLocaleString()} in · ${usage.output.toLocaleString()} out`}>
               {compactTokens(usage.input)} in · {compactTokens(usage.output)} out</dd></div>}</dl></section>
+        {/* The run's plan, as the steps amend it — the structured form of the state block they end their messages with. */}
+        {sharedState !== undefined && sharedState.planItems.length > 0 && <section className="plan-panel">
+          <p className="eyebrow">Plan · {sharedState.planItems.filter((item) => item.status === "done").length}/{
+            sharedState.planItems.filter((item) => item.status !== "dropped").length}</p>
+          <ol className="plan-list">{sharedState.planItems.map((item) => <li key={item.id} className={`plan-item ${item.status}`}>
+            <span className="plan-mark" aria-hidden="true">{item.status === "done" ? <Check size={11} strokeWidth={3.5} />
+              : item.status === "dropped" ? <X size={11} strokeWidth={3.5} /> : null}</span>
+            <span className="plan-title" title={item.title}>{item.title}</span></li>)}</ol>
+          {sharedState.decisions.length > 0 && <>
+            <p className="eyebrow plan-sub">Decisions</p>
+            <ul className="plan-notes">{sharedState.decisions.map((decision) => <li key={decision}>{decision}</li>)}</ul></>}
+          {sharedState.openQuestions.length > 0 && <>
+            <p className="eyebrow plan-sub">Open questions</p>
+            <ul className="plan-notes">{sharedState.openQuestions.map((item) => <li key={item}>{item}</li>)}</ul></>}
+        </section>}
         {/* Traffic lights only; versions and detected status live in Settings. */}
         <section><p className="eyebrow">Providers</p><div className="provider-list">{agents.map((agent) => {
           const state = providerDotState(agent, busyAgentId);

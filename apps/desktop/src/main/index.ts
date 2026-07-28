@@ -3,19 +3,19 @@ import { rmSync } from "node:fs";
 import { mkdir, realpath, writeFile } from "node:fs/promises";
 import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
-import { AgentManager, PermissionManager, canonicalizeWorkspaceRoot, redactSensitiveData } from "@waing/agent-core";
+import { AgentManager, PermissionManager, WorkspaceFileIndex, canonicalizeWorkspaceRoot, redactSensitiveData } from "@waing/agent-core";
 import { CodexAdapter } from "@waing/adapter-codex";
 import { ClaudeAdapter } from "@waing/adapter-claude";
 import { AntigravityAdapter } from "@waing/adapter-antigravity";
 import { OpenCodeAdapter } from "@waing/adapter-opencode";
 import { AgentRouterClient, AutoSelector, OpenCodeRouterClient, RouterManager } from "@waing/router";
 import type { RouterClient } from "@waing/router";
-import { AgentStepExecutor, InMemoryWorkflowRepository, ROLE_ORDER, WorkflowCompiler, WorkflowEngine,
-  buildDefaultRoleProfiles, sortRoleProfiles } from "@waing/workflow";
+import { ADAPTIVE_ROUTER_POLICY, AgentStepExecutor, InMemoryWorkflowRepository, ROLE_ORDER, WorkflowCompiler,
+  WorkflowEngine, WorkflowEventBus, WorkflowValidator, buildDefaultRoleProfiles, sortRoleProfiles } from "@waing/workflow";
 import type { GlobalRoleProfiles } from "@waing/workflow";
 import { PersistenceStore, SqliteDatabase, SqliteWorkflowRepository } from "@waing/persistence";
 import { IPC_CHANNELS, agentModelsInputSchema, conversationIdInputSchema, conversationRemoveInputSchema, emptyInputSchema,
-  attachmentChoiceSchema, attachmentsAddInputSchema, permissionResponseInputSchema, projectIdInputSchema, roleProfilesInputSchema, routerPreviewInputSchema, runFakeInputSchema,
+  attachmentChoiceSchema, attachmentsAddInputSchema, fileSearchInputSchema, permissionResponseInputSchema, questionResponseInputSchema, projectIdInputSchema, roleProfilesInputSchema, routerPreviewInputSchema, runFakeInputSchema,
   sessionCancelInputSchema, sessionSendInputSchema, workflowRunInputSchema, openLinkInputSchema } from "@waing/ipc-contracts";
 import type { AttachmentChoice, ConversationHistory, RoleProfilesView, SessionSendResult } from "@waing/ipc-contracts";
 import type { AgentDescriptor, AgentRequest, AppConversation, Project, RoleExecutionProfile } from "@waing/domain";
@@ -25,6 +25,7 @@ import { SecretStore } from "./SecretStore";
 const projects = new Map<string, Project>();
 const agentManager = new AgentManager();
 const permissionManager = new PermissionManager();
+const workspaceFiles = new WorkspaceFileIndex();
 const assistantBuffers = new Map<string, string>();
 /** Workflow step sessions use the run id internally; persistence and the UI use the stable app conversation id. */
 const workflowConversationIds = new Map<string, string>();
@@ -98,8 +99,14 @@ agentManager.registry.register(new AntigravityAdapter());
 agentManager.registry.register(new OpenCodeAdapter());
 agentManager.eventBus.subscribe((event) => {
   if (event.type !== "permission.requested") return;
-  const projectId = agentManager.sessions.get(event.sessionId).projectId;
-  void permissionManager.request(projectId, event.request).then((decision) => {
+  const session = agentManager.sessions.get(event.sessionId);
+  const projectId = session.projectId;
+  // Every workflow step opens its own provider session, so "allow for session" is remembered against the
+  // conversation instead — otherwise the same command is re-approved at every handoff between roles.
+  const scopeId = workflowConversationIds.get(session.conversationId) ?? session.conversationId;
+  const profile = agentManager.permissionProfileFor(event.sessionId);
+  void permissionManager.request(projectId, event.request,
+    { scopeId, ...(profile === undefined ? {} : { profile }) }).then((decision) => {
     try { persistence?.savePermission(projectId, event.request, decision); }
     catch { /* a persistence failure must not strand an active provider approval */ }
     return agentManager.respondToPermission(event.sessionId, event.request.id, decision);
@@ -188,8 +195,11 @@ async function runChatWorkflow(project: Project, task: string, workflowTask = ta
   await repository.saveDefinition(definition);
   const ownedRouterSessionIds = new Set<string>();
   const routerClient = createRouterClient(routerProfile, project, (sessionId) => ownedRouterSessionIds.add(sessionId));
-  // A router call may have to cold-start a provider CLI, which routinely outlasts the 15s library default.
-  const engine = new WorkflowEngine(repository, new AgentStepExecutor(agentManager), new RouterManager(routerClient, ROUTER_TIMEOUT_MS));
+  // A router call may have to cold-start a provider CLI, which routinely outlasts the 15s library default. The chat
+  // preset consults the router after every step, so it also needs the larger decision budget that loop is sized for.
+  const engine = new WorkflowEngine(repository, new AgentStepExecutor(agentManager),
+    new RouterManager(routerClient, ROUTER_TIMEOUT_MS), new WorkflowEventBus(), new WorkflowValidator(),
+    ADAPTIVE_ROUTER_POLICY);
   const title = existingConversation?.title ?? task.slice(0, 80);
   let conversation: AppConversation = existingConversation ?? { id: randomUUID(), projectId: project.id, title,
     createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
@@ -270,6 +280,8 @@ function registerIpc(): void {
     if (result.canceled || selected === undefined) return null;
 
     const root = await canonicalizeWorkspaceRoot(await realpath(selected));
+    // Scanning now means the first `@` in the composer renders from cache instead of waiting on a cold scan.
+    void workspaceFiles.warm(root).catch(() => { /* the picker rescans on demand */ });
     const existing = [...projects.values()].find((project) => project.root === root);
     if (existing !== undefined) return existing;
 
@@ -288,8 +300,10 @@ function registerIpc(): void {
   ipcMain.handle(IPC_CHANNELS.projectsRemove, (event, input: unknown) => {
     assertTrustedIpc(event);
     const { projectId } = projectIdInputSchema.parse(input);
-    if (!projects.has(projectId)) throw new Error("Unknown project");
+    const removed = projects.get(projectId);
+    if (removed === undefined) throw new Error("Unknown project");
     persistence?.removeProject(projectId);
+    workspaceFiles.invalidate(removed.root);
     projects.delete(projectId);
     return [...projects.values()];
   });
@@ -364,6 +378,13 @@ function registerIpc(): void {
     assertTrustedIpc(event);
     const { agentId } = agentModelsInputSchema.parse(input);
     return agentManager.registry.get(agentId).listModels();
+  });
+  ipcMain.handle(IPC_CHANNELS.filesSearch, async (event, input: unknown) => {
+    assertTrustedIpc(event);
+    const { projectId, query, limit } = fileSearchInputSchema.parse(input);
+    const project = projects.get(projectId);
+    if (project === undefined) throw new Error("Unknown project");
+    return workspaceFiles.search(project.root, query, limit ?? 20);
   });
   ipcMain.handle(IPC_CHANNELS.attachmentsChoose, async (event, input: unknown): Promise<AttachmentChoice[]> => {
     assertTrustedIpc(event);
@@ -476,6 +497,11 @@ function registerIpc(): void {
     assertTrustedIpc(event);
     const response = permissionResponseInputSchema.parse(input);
     permissionManager.respond(response.requestId, response.decision, response.sessionId);
+  });
+  ipcMain.handle(IPC_CHANNELS.questionsRespond, async (event, input: unknown) => {
+    assertTrustedIpc(event);
+    const response = questionResponseInputSchema.parse(input);
+    await agentManager.respondToQuestion(response.sessionId, response.questionId, response.answers);
   });
   ipcMain.handle(IPC_CHANNELS.routerPreview, async (event, input: unknown) => {
     assertTrustedIpc(event);

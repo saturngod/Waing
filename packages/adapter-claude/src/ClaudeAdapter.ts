@@ -5,9 +5,32 @@ import { AsyncQueue, providerCompatibility } from "@waing/agent-core";
 import type { CodingAgent } from "@waing/agent-core";
 import { AgentError } from "@waing/domain";
 import type {
-  AgentDescriptor, AgentEvent, AgentModelDescriptor, AgentRequest, AgentRun, AgentSession,
-  PermissionDecision, ResumeSessionInput, StartSessionInput,
+  AgentDescriptor, AgentEvent, AgentModelDescriptor, AgentQuestionItem, AgentQuestionResponse, AgentRequest,
+  AgentRun, AgentSession, PermissionDecision, ResumeSessionInput, StartSessionInput,
 } from "@waing/domain";
+
+/** Claude's built-in question tool. The CLI can only render it in its own terminal UI, so an SDK host that
+ * lets it execute gets "The user did not answer the questions." back — the question must be intercepted
+ * at the permission callback instead, and the answer returned as the tool's result. */
+const QUESTION_TOOL = "AskUserQuestion";
+
+function parseQuestions(input: Record<string, unknown>): AgentQuestionItem[] {
+  const raw = Array.isArray(input.questions) ? input.questions : [];
+  return raw.flatMap((entry): AgentQuestionItem[] => {
+    if (typeof entry !== "object" || entry === null) return [];
+    const item = entry as Record<string, unknown>;
+    const options = (Array.isArray(item.options) ? item.options : []).flatMap((choice) => {
+      if (typeof choice !== "object" || choice === null) return [];
+      const values = choice as Record<string, unknown>;
+      return typeof values.label === "string" && values.label.length > 0
+        ? [{ label: values.label, description: typeof values.description === "string" ? values.description : "" }] : [];
+    });
+    if (typeof item.question !== "string" || options.length === 0) return [];
+    return [{ question: item.question, header: typeof item.header === "string" && item.header.length > 0
+      ? item.header : item.question.slice(0, 12),
+      ...(item.multiSelect === true ? { multiSelect: true } : {}), options }];
+  }).slice(0, 4);
+}
 
 type QueryFactory = (params: { prompt: string; options?: Options }) => Query;
 type EventBaseKeys = "id" | "sessionId" | "runId" | "agentId" | "timestamp" | "sequence";
@@ -27,6 +50,10 @@ export class ClaudeAdapter implements CodingAgent {
   private readonly permissionResolvers = new Map<string, {
     sessionId: string;
     suggestions?: Parameters<CanUseTool>[2]["suggestions"];
+    resolve: (result: PermissionResult) => void;
+  }>();
+  private readonly questionResolvers = new Map<string, {
+    sessionId: string;
     resolve: (result: PermissionResult) => void;
   }>();
 
@@ -87,6 +114,7 @@ export class ClaudeAdapter implements CodingAgent {
   }
 
   async cancel(sessionId: string): Promise<void> {
+    this.releaseQuestions(sessionId);
     const active = this.requireSession(sessionId).active;
     if (active !== undefined) await active.query.interrupt();
   }
@@ -106,8 +134,25 @@ export class ClaudeAdapter implements CodingAgent {
     return Promise.resolve();
   }
 
+  /** The CLI has no channel for handing an answer to a tool it is executing, so the tool call is refused and
+   * the answer travels back as the refusal message — which is what the model reads as the tool result. */
+  respondToQuestion(sessionId: string, questionId: string, answers: AgentQuestionResponse): Promise<void> {
+    const pending = this.questionResolvers.get(questionId);
+    if (pending === undefined || pending.sessionId !== sessionId) {
+      throw new AgentError("SESSION_NOT_FOUND", `Unknown Claude question: ${questionId}`, this.id);
+    }
+    this.questionResolvers.delete(questionId);
+    pending.resolve({ behavior: "deny", message: answers.length === 0
+      ? "The user did not answer the questions."
+      : answers.map((answer) => `${answer.header}: ${answer.values.join(", ")}`).join("\n") });
+    const state = this.requireSession(sessionId);
+    this.emit(state, state.active?.runId ?? questionId, { type: "question.resolved", questionId, answers });
+    return Promise.resolve();
+  }
+
   closeSession(sessionId: string): Promise<void> {
     const state = this.requireSession(sessionId);
+    this.releaseQuestions(sessionId);
     state.active?.query.close();
     state.queue.end();
     this.sessions.delete(sessionId);
@@ -115,6 +160,7 @@ export class ClaudeAdapter implements CodingAgent {
   }
 
   shutdown(): Promise<void> {
+    for (const sessionId of this.sessions.keys()) this.releaseQuestions(sessionId);
     for (const state of this.sessions.values()) {
       state.active?.query.close(); state.queue.end();
     }
@@ -181,6 +227,7 @@ export class ClaudeAdapter implements CodingAgent {
   private createPermissionHandler(state: ClaudeSessionState, runId: string): CanUseTool {
     return (toolName, input, options) => {
       const requestId = options.toolUseID;
+      if (toolName === QUESTION_TOOL) return this.askQuestion(state, runId, requestId, input);
       const command = toolName === "Bash" && typeof input.command === "string" ? [input.command] : undefined;
       const filePath = typeof input.file_path === "string" ? [input.file_path] :
         options.blockedPath === undefined ? undefined : [options.blockedPath];
@@ -195,6 +242,28 @@ export class ClaudeAdapter implements CodingAgent {
         sessionId: state.session.id, suggestions: options.suggestions, resolve,
       }));
     };
+  }
+
+  /** Parks the tool call and surfaces the question. Nothing else can answer it, so a run left waiting here
+   * would only end at the step timeout. */
+  private askQuestion(state: ClaudeSessionState, runId: string, questionId: string,
+    input: Record<string, unknown>): Promise<PermissionResult> {
+    const questions = parseQuestions(input);
+    if (questions.length === 0) {
+      return Promise.resolve({ behavior: "deny", message: "The user did not answer the questions." });
+    }
+    this.emit(state, runId, { type: "question.requested",
+      question: { id: questionId, sessionId: state.session.id, runId, agentId: this.id, questions } });
+    return new Promise((resolve) => this.questionResolvers.set(questionId, { sessionId: state.session.id, resolve }));
+  }
+
+  /** A parked question holds the SDK's tool call open; leaving one behind would hang the run past cancellation. */
+  private releaseQuestions(sessionId: string): void {
+    for (const [questionId, pending] of this.questionResolvers) {
+      if (pending.sessionId !== sessionId) continue;
+      this.questionResolvers.delete(questionId);
+      pending.resolve({ behavior: "deny", message: "The user did not answer the questions." });
+    }
   }
 
   private recordSession(input: StartSessionInput, providerSessionId?: string): AgentSession {

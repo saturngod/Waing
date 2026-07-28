@@ -31,7 +31,8 @@ export function buildDefaultRoleProfiles(descriptors: readonly AgentDescriptor[]
     const ranked = preferences[role];
     const agentId = ranked.find((id) => usable.has(id)) ?? ranked.find((id) => installed.has(id)) ?? ranked[0]!;
     return {
-      role, enabled: true, agentId, effort: efforts[role], mode: role === "review" ? "review" : role === "planning" ? "plan" : "execute",
+      // No mode: the workflow derives it from the node, so seeding one here could only ever disagree with the role.
+      role, enabled: true, agentId, effort: efforts[role],
       permissionProfileId: "ask_before_changes", timeoutMs: 1_800_000, maxRetries: 0,
     } satisfies RoleExecutionProfile;
   });

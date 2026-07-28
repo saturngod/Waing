@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type {
   AgentCapabilities,
   AgentDescriptor,
@@ -35,8 +35,8 @@ const capabilities: AgentCapabilities = {
 };
 
 class FakeAgent implements CodingAgent {
-  readonly id = "fake";
-  private readonly queues = new Map<string, AsyncQueue<AgentEvent>>();
+  readonly id: string = "fake";
+  protected readonly queues = new Map<string, AsyncQueue<AgentEvent>>();
   private sequence = 0;
 
   discover(): Promise<AgentDescriptor> {
@@ -75,6 +75,7 @@ class FakeAgent implements CodingAgent {
   closeSession() { return Promise.resolve(); }
   shutdown() { for (const queue of this.queues.values()) queue.end(); return Promise.resolve(); }
   events(sessionId: string): AsyncIterable<AgentEvent> { return this.queues.get(sessionId) ?? new AsyncQueue(); }
+  protected push(sessionId: string, event: AgentEvent): void { this.queues.get(sessionId)?.push(event); }
 
   private emit(
     sessionId: string,
@@ -85,6 +86,27 @@ class FakeAgent implements CodingAgent {
       id: randomUUID(), sessionId, runId, agentId: this.id, timestamp: new Date().toISOString(),
       sequence: this.sequence++, ...payload,
     });
+  }
+}
+
+/** Emits two overlapping approvals plus one event the schema rejects, the shapes that used to kill the pump. */
+class StackingAgent extends FakeAgent {
+  override readonly id = "stacking";
+  override send(sessionId: string, _request: AgentRequest): Promise<AgentRun> {
+    const run = { id: randomUUID(), sessionId, startedAt: new Date().toISOString() };
+    const base = { sessionId, runId: run.id, agentId: this.id, timestamp: new Date().toISOString() };
+    const request = { id: "request-1", sessionId, runId: run.id, agentId: this.id, kind: "shell" as const,
+      title: "Run tests", detail: "npm test", risk: "medium" as const };
+    this.push(sessionId, { ...base, id: randomUUID(), sequence: 0, type: "run.started" });
+    this.push(sessionId, { ...base, id: randomUUID(), sequence: 1, type: "permission.requested", request });
+    this.push(sessionId, { ...base, id: randomUUID(), sequence: 2, type: "question.requested", question: {
+      id: "question-1", sessionId, runId: run.id, agentId: this.id,
+      questions: [{ question: "Which one?", header: "Pick", options: [{ label: "A", description: "" }] }] } });
+    this.push(sessionId, { ...base, id: randomUUID(), sequence: 3, type: "nonsense" } as unknown as AgentEvent);
+    this.push(sessionId, { ...base, id: randomUUID(), sequence: 4, type: "question.resolved",
+      questionId: "question-1", answers: [{ header: "Pick", values: ["A"] }] });
+    this.push(sessionId, { ...base, id: randomUUID(), sequence: 5, type: "run.completed", summary: "done" });
+    return Promise.resolve(run);
   }
 }
 
@@ -124,6 +146,26 @@ describe("AgentManager", () => {
     await expect(manager.send(session.id, {
       text: "plan", projectRoot: "/tmp/project", mode: "plan",
     })).rejects.toBeInstanceOf(AgentCapabilityError);
+    await manager.shutdown();
+  });
+
+  it("keeps pumping when a provider stacks two approvals and one event is unnormalizable", async () => {
+    const manager = new AgentManager();
+    const agent = new StackingAgent();
+    manager.registry.register(agent);
+    const seen: AgentEvent[] = [];
+    manager.eventBus.subscribe((event) => seen.push(event));
+    const session = await manager.startSession("stacking", {
+      conversationId: "conversation-1", projectId: "project-1", projectRoot: "/tmp/project",
+    });
+    await manager.send(session.id, { text: "go", projectRoot: "/tmp/project", mode: "execute" });
+    await vi.waitFor(() => { expect(seen.map((event) => event.type)).toContain("run.completed"); });
+    // The second request used to be an illegal waiting_permission → waiting_permission transition, which threw
+    // inside the pump and silently stranded every later event — including the run's own terminal one.
+    expect(seen.map((event) => event.type)).toEqual([
+      "run.started", "permission.requested", "question.requested", "question.resolved", "run.completed",
+    ]);
+    expect(manager.sessions.get(session.id).status).toBe("completed");
     await manager.shutdown();
   });
 

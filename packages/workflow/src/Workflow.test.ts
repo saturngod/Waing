@@ -8,9 +8,10 @@ import { mergeSharedState } from "./ContextStore";
 import { ProfileResolver } from "./ProfileResolver";
 import type { GlobalRoleProfiles } from "./ProfileResolver";
 import type { StepExecutionInput, WorkflowStepExecutor } from "./StepExecutor";
-import { WorkflowCompiler } from "./WorkflowCompiler";
+import { ADAPTIVE_MAX_ITERATIONS, ADAPTIVE_ROUTER_POLICY, WorkflowCompiler } from "./WorkflowCompiler";
 import { WorkflowEngine } from "./WorkflowEngine";
 import type { WorkflowRouter } from "./WorkflowEngine";
+import { WorkflowEventBus } from "./WorkflowEventBus";
 import { InMemoryWorkflowRepository } from "./WorkflowRepository";
 import { WorkflowRunCoordinator } from "./WorkflowRunCoordinator";
 import { WorkflowValidator } from "./WorkflowValidator";
@@ -28,6 +29,12 @@ class QueueRouter implements WorkflowRouter {
     this.inputs.push(input); const decision = this.decisions.shift();
     if (decision === undefined) throw new Error("No queued router decision"); return Promise.resolve(decision);
   }
+}
+
+class AlwaysRouter implements WorkflowRouter {
+  count = 0;
+  constructor(private readonly answer: RouterOrchestrationDecision) {}
+  decideNext(): Promise<unknown> { this.count += 1; return Promise.resolve(this.answer); }
 }
 
 const decision = (action: RouterOrchestrationDecision["action"]): RouterOrchestrationDecision => ({
@@ -196,7 +203,7 @@ describe("WorkflowEngine", () => {
   });
 
   it("runs the adaptive chat preset task → document → complete and hands the prior work to each step", async () => {
-    const router = new QueueRouter([decision("execute_medium"), decision("write_documentation")]);
+    const router = new QueueRouter([decision("execute_medium"), decision("write_documentation"), decision("complete")]);
     const executor = new FakeStepExecutor();
     const result = await new WorkflowEngine(new InMemoryWorkflowRepository(), executor, router).run({
       definition: new WorkflowCompiler().compilePreset("adaptive"), profiles, projectId: "p", projectRoot: "/tmp",
@@ -208,8 +215,8 @@ describe("WorkflowEngine", () => {
       filesChanged: ["src/index.ts"] }]);
     expect(documentStep?.documentInput?.stepResults).toHaveLength(1);
     expect(documentStep?.documentInput).toMatchObject({ operation: "create", kind: "readme", targetPath: "final_document.md" });
-    // Documentation is the last stage, so it flows straight to completion without another router call.
-    expect(router.inputs.map((input) => input.checkpointReason)).toEqual(["initial", "after_execution"]);
+    // Every step returns to the same checkpoint, so writing the document also ends in a decision — "nothing left".
+    expect(router.inputs.map((input) => input.checkpointReason)).toEqual(["initial", "after_execution", "after_execution"]);
   });
 
   it("lets the adaptive preset complete without the optional review or document gate", async () => {
@@ -233,10 +240,61 @@ describe("WorkflowEngine", () => {
     expect(executor.calls[0]?.profile).toMatchObject({ role: "planning", mode: "plan" });
   });
 
+  it("hands a finished plan to an implementing role instead of letting the planner keep working", async () => {
+    const executor = new FakeStepExecutor();
+    const result = await new WorkflowEngine(new InMemoryWorkflowRepository(), executor,
+      new QueueRouter([decision("plan"), decision("execute_medium"), decision("complete")])).run({
+      definition: new WorkflowCompiler().compilePreset("adaptive"), profiles, projectId: "p", projectRoot: "/tmp",
+      task: "Plan the refactor, then do it" });
+    expect(result.run.status).toBe("completed");
+    expect(executor.calls.map((call) => call.node.id)).toEqual(["planning", "medium"]);
+    // The plan is the whole point of the handoff, so the implementer must arrive holding it.
+    expect(executor.calls[1]?.handoff.priorStepSummaries).toMatchObject([{ role: "planning" }]);
+  });
+
+  it("keeps asking the router after every step until it answers complete", async () => {
+    const executor = new FakeStepExecutor(["fail", "pass"]);
+    const router = new QueueRouter([decision("plan"), decision("execute_high"), decision("review"), decision("fix"),
+      decision("review"), decision("write_documentation"), decision("complete")]);
+    const result = await new WorkflowEngine(new InMemoryWorkflowRepository(), executor, router).run({
+      definition: new WorkflowCompiler().compilePreset("adaptive"), profiles, projectId: "p", projectRoot: "/tmp",
+      task: "Plan it, build it, check it, write it up" });
+    expect(result.run.status).toBe("completed");
+    expect(executor.calls.map((call) => call.node.id)).toEqual(["planning", "high", "review", "fix", "review", "document"]);
+    // One checkpoint per finished step, all at the same node — the loop, not a pipeline of one-shot gates.
+    expect(router.inputs).toHaveLength(7);
+    expect(result.context.routerDecisionHistory.map((record) => record.routerNodeId).slice(1))
+      .toEqual(Array.from({ length: 6 }, () => "route-next"));
+  });
+
+  it("hands the router the run's plan state so it can tell whether anything is left", async () => {
+    const executor = new StatefulStepExecutor(["pass"]);
+    const router = new QueueRouter([decision("execute_medium"), decision("review"), decision("complete")]);
+    await new WorkflowEngine(new InMemoryWorkflowRepository(), executor, router).run({
+      definition: new WorkflowCompiler().compilePreset("adaptive"), profiles, projectId: "p", projectRoot: "/tmp",
+      task: "Ship it" });
+    // The first checkpoint runs before any step, so the plan only exists from the second one on.
+    expect(router.inputs[0]?.sharedState).toBeUndefined();
+    expect(router.inputs[1]?.sharedState?.planItems.map((item) => item.id)).toEqual(["p1"]);
+  });
+
+  it("ends a router that never says complete at the loop budget instead of failing the run", async () => {
+    const executor = new FakeStepExecutor();
+    const router = new AlwaysRouter(decision("execute_low"));
+    const result = await new WorkflowEngine(new InMemoryWorkflowRepository(), executor, router, new WorkflowEventBus(),
+      new WorkflowValidator(), ADAPTIVE_ROUTER_POLICY).run({
+      definition: new WorkflowCompiler().compilePreset("adaptive"), profiles, projectId: "p", projectRoot: "/tmp",
+      task: "Never-ending work" });
+    expect(result.run.status).toBe("completed");
+    expect(executor.calls).toHaveLength(ADAPTIVE_MAX_ITERATIONS);
+    expect(router.count).toBeLessThan(ADAPTIVE_ROUTER_POLICY.maxRouterDecisions);
+  });
+
   it("gives only the reviewer the diff and hands every other role the changed paths instead", async () => {
     const executor = new DiffStepExecutor(["fail", "pass"]);
     const result = await new WorkflowEngine(new InMemoryWorkflowRepository(), executor,
-      new QueueRouter([decision("execute_medium"), decision("review"), decision("complete")])).run({
+      new QueueRouter([decision("execute_medium"), decision("review"), decision("fix"), decision("review"),
+        decision("complete")])).run({
       definition: new WorkflowCompiler().compilePreset("adaptive"), profiles, projectId: "p", projectRoot: "/tmp",
       task: "Risky change" });
     expect(result.run.status).toBe("completed");
@@ -253,7 +311,8 @@ describe("WorkflowEngine", () => {
     // medium and fix both run on codex; review runs on antigravity in between.
     const executor = new SessionedStepExecutor(["fail", "pass"]);
     const result = await new WorkflowEngine(new InMemoryWorkflowRepository(), executor,
-      new QueueRouter([decision("execute_medium"), decision("review"), decision("complete")])).run({
+      new QueueRouter([decision("execute_medium"), decision("review"), decision("fix"), decision("review"),
+        decision("complete")])).run({
       definition: new WorkflowCompiler().compilePreset("adaptive"), profiles, projectId: "p", projectRoot: "/tmp",
       task: "Risky change" });
     expect(result.run.status).toBe("completed");
@@ -285,6 +344,19 @@ describe("WorkflowEngine", () => {
     expect(executor.calls[0]?.handoff.sharedState).toBeUndefined();
     expect(executor.calls[1]?.handoff.sharedState).toEqual({ planItems: [{ id: "p1", title: "Medium Level Task plan item",
       status: "done" }], decisions: ["Decided at medium"], openQuestions: [] });
+  });
+
+  it("publishes the merged plan after every step that amends it", async () => {
+    const engine = new WorkflowEngine(new InMemoryWorkflowRepository(), new StatefulStepExecutor(["pass"]),
+      new QueueRouter([decision("execute_medium"), decision("review"), decision("complete")]));
+    const states: string[][] = [];
+    engine.events.subscribe((event) => {
+      if (event.type === "workflow.state.updated") states.push(event.sharedState.planItems.map((item) => item.id));
+    });
+    await engine.run({ definition: new WorkflowCompiler().compilePreset("adaptive"), profiles, projectId: "p",
+      projectRoot: "/tmp", task: "Ship it" });
+    // Each event carries the whole plan so far, not the step's own amendment.
+    expect(states).toEqual([["p1"], ["p1", "p2"]]);
   });
 
   it("revises a plan item in place by id instead of accumulating duplicates", () => {

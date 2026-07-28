@@ -1,8 +1,22 @@
 import { randomUUID } from "node:crypto";
-import type { WorkflowDefinition, WorkflowEdge, WorkflowNode } from "@waing/domain";
+import type { WorkflowDefinition, WorkflowEdge, WorkflowNextActionKind, WorkflowNode } from "@waing/domain";
 import { WorkflowValidator } from "./WorkflowValidator";
 
 export type WorkflowPresetKind = "standard" | "review_loop" | "review_documentation" | "prd_driven" | "adaptive";
+
+/** Declares the chat loop's cycles as guarded, and bounds how many times the router may send work back around. */
+const ADAPTIVE_LOOP_ID = "chat-work";
+/** Kept below the engine's router decision budget so a long run ends at the loop's graceful exit, not on an error. */
+export const ADAPTIVE_MAX_ITERATIONS = 20;
+/**
+ * The chat loop asks the router once per step, so the default budget of a fixed pipeline would fail a long run
+ * partway through. `work-loop` is what actually stops it; this only has to stay above the loop's own ceiling.
+ */
+export const ADAPTIVE_ROUTER_POLICY = { maxRouterDecisions: ADAPTIVE_MAX_ITERATIONS + 4,
+  maxSameActionWithoutStateChange: 2, onExhausted: "ask_user" } as const;
+const ADAPTIVE_ROUTES: ReadonlyArray<readonly [WorkflowNextActionKind, string]> = [["plan", "planning"],
+  ["execute_low", "low"], ["execute_medium", "medium"], ["execute_high", "high"], ["review", "review"],
+  ["fix", "fix"], ["write_documentation", "document"]];
 
 export class WorkflowCompiler {
   constructor(private readonly validator = new WorkflowValidator()) {}
@@ -46,40 +60,46 @@ export class WorkflowCompiler {
     for (const id of from) edges.push({ id: `${id}-complete`, from: id, to: "complete", condition: { type: "always" } });
   }
   /**
-   * Chat preset: the router picks the implementing role, then decides after each stage whether the work still needs a
-   * review or a document before completing. Review and document are optional gates, so a plain question can finish
-   * right after the task step while a build can add docs and a review pass without a second user prompt.
+   * Chat preset: one router loop rather than a fixed pipeline. Every role returns to the same checkpoint, where the
+   * router answers the only question it ever has to answer — is there more work, and which role does it? — and keeps
+   * answering it until it says "complete". So a plan is handed to an implementer, an implementation can be reviewed,
+   * a failed review can be fixed and reviewed again, and a one-line question still finishes after a single step,
+   * without any of that order being hard-coded here.
+   *
+   * `work-loop` is the budget. It sits on the way back to the checkpoint and counts the trips, so a router that keeps
+   * finding more to do still terminates instead of running until the decision budget fails the whole workflow.
    */
   private addAdaptiveFlow(nodes: WorkflowNode[], edges: WorkflowEdge[]): void {
     nodes.push(
-      { id: "route-next", label: "Route after task", enabled: true, type: "router", role: "router",
-        checkpoint: "after_execution", allowedActions: ["review", "write_documentation", "complete"] },
+      { id: "route-next", label: "Route next step", enabled: true, type: "router", role: "router",
+        checkpoint: "after_execution", allowedActions: ["plan", "execute_low", "execute_medium", "execute_high",
+          "review", "fix", "write_documentation", "complete"] },
       { id: "review", label: "Review", enabled: true, type: "review_gate", role: "review", optional: true,
         passEdge: "review-pass", failEdge: "review-fail" },
       { id: "fix", label: "Bug Fix", enabled: true, type: "role_task", role: "bugfix" },
-      { id: "review-loop", label: "Review loop", enabled: true, type: "loop", loopId: "review-fix",
-        bodyEntryNodeId: "review", exitNodeId: "route-after-review", maxIterations: 3, stopCondition: "review_passed",
-        onExhausted: "continue_with_warning" },
-      { id: "route-after-review", label: "Route after review", enabled: true, type: "router", role: "router",
-        checkpoint: "after_review", allowedActions: ["write_documentation", "complete"] },
       { id: "document", label: "Write Documentation", enabled: true, type: "document", role: "document",
         operation: "create", documentKind: "custom", optional: true },
+      { id: "work-loop", label: "Work loop", enabled: true, type: "loop", loopId: ADAPTIVE_LOOP_ID,
+        bodyEntryNodeId: "route-next", exitNodeId: "complete", maxIterations: ADAPTIVE_MAX_ITERATIONS,
+        stopCondition: "condition_true", onExhausted: "continue_with_warning" },
       { id: "complete", label: "Complete", enabled: true, type: "complete" },
     );
-    for (const id of ["planning", "low", "medium", "high"]) edges.push({ id: `${id}-next`, from: id, to: "route-next", condition: { type: "always" } });
+    // Every role ends in the same place — back at the loop, which decides whether the router gets another turn.
+    for (const id of ["planning", "low", "medium", "high", "fix", "document"]) {
+      edges.push({ id: `${id}-next`, from: id, to: "work-loop", loopId: ADAPTIVE_LOOP_ID, condition: { type: "always" } });
+    }
+    // A verdict no longer picks the next node by itself: it travels to the checkpoint as part of the run's state, and
+    // the router decides whether it means fix, review again, or done.
     edges.push(
-      { id: "next-review", from: "route-next", to: "review", condition: { type: "router_action", action: "review" } },
-      { id: "next-document", from: "route-next", to: "document", condition: { type: "router_action", action: "write_documentation" } },
+      { id: "review-pass", from: "review", to: "work-loop", loopId: ADAPTIVE_LOOP_ID, condition: { type: "review_result", result: "pass" } },
+      { id: "review-fail", from: "review", to: "work-loop", loopId: ADAPTIVE_LOOP_ID, condition: { type: "review_result", result: "fail" } },
+      { id: "loop-continue", from: "work-loop", to: "route-next", loopId: ADAPTIVE_LOOP_ID, condition: { type: "loop_remaining" } },
+      { id: "loop-exhausted", from: "work-loop", to: "complete", condition: { type: "loop_exhausted" } },
       { id: "next-complete", from: "route-next", to: "complete", condition: { type: "router_action", action: "complete" } },
-      { id: "review-pass", from: "review", to: "route-after-review", condition: { type: "review_result", result: "pass" } },
-      { id: "review-fail", from: "review", to: "fix", condition: { type: "review_result", result: "fail" } },
-      { id: "fix-loop", from: "fix", to: "review-loop", condition: { type: "always" } },
-      { id: "loop-review", from: "review-loop", to: "review", loopId: "review-fix", condition: { type: "loop_remaining" } },
-      { id: "loop-exhausted", from: "review-loop", to: "route-after-review", condition: { type: "loop_exhausted" } },
-      { id: "after-review-document", from: "route-after-review", to: "document", condition: { type: "router_action", action: "write_documentation" } },
-      { id: "after-review-complete", from: "route-after-review", to: "complete", condition: { type: "router_action", action: "complete" } },
-      { id: "document-complete", from: "document", to: "complete", condition: { type: "always" } },
     );
+    for (const [action, to] of ADAPTIVE_ROUTES) {
+      edges.push({ id: `next-${to}`, from: "route-next", to, loopId: ADAPTIVE_LOOP_ID, condition: { type: "router_action", action } });
+    }
   }
 
   private addReviewLoop(nodes: WorkflowNode[], edges: WorkflowEdge[], docs: boolean): void {

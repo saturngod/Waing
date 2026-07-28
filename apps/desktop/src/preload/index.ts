@@ -3,7 +3,7 @@ import { IPC_CHANNELS } from "@waing/ipc-contracts/channels";
 import type { AppInfo, AttachmentChoice, AttachmentUpload, ConversationHistory, DesktopApi, DesktopWorkflowEvent, RoleProfilesView, SessionSendResult, WorkflowRunView } from "@waing/ipc-contracts";
 import type { z } from "zod";
 import type { workflowRunInputSchema } from "@waing/ipc-contracts";
-import type { AgentDescriptor, AgentEvent, AgentModelDescriptor, AgentSession, AppConversation, AutoSelection, PermissionDecision, Project, RoleExecutionProfile } from "@waing/domain";
+import type { AgentDescriptor, AgentEvent, AgentModelDescriptor, AgentQuestionResponse, AgentSession, AppConversation, AutoSelection, PermissionDecision, Project, RoleExecutionProfile, WorkspaceFileMatches } from "@waing/domain";
 
 const invoke = <T>(channel: string): Promise<T> => ipcRenderer.invoke(channel, undefined) as Promise<T>;
 
@@ -29,6 +29,11 @@ const desktopApi: DesktopApi = Object.freeze({
     refresh: () => invoke<AgentDescriptor[]>(IPC_CHANNELS.agentsRefresh),
     models: (agentId: string) => ipcRenderer.invoke(IPC_CHANNELS.agentsModels, { agentId }) as Promise<AgentModelDescriptor[]>,
   }),
+  files: Object.freeze({
+    search: (projectId: string, query: string, limit?: number) =>
+      ipcRenderer.invoke(IPC_CHANNELS.filesSearch,
+        { projectId, query, ...(limit === undefined ? {} : { limit }) }) as Promise<WorkspaceFileMatches>,
+  }),
   attachments: Object.freeze({
     choose: () => invoke<AttachmentChoice[]>(IPC_CHANNELS.attachmentsChoose),
     add: (files: AttachmentUpload[]) =>
@@ -53,6 +58,10 @@ const desktopApi: DesktopApi = Object.freeze({
   permissions: Object.freeze({
     respond: (sessionId: string, requestId: string, decision: PermissionDecision) =>
       ipcRenderer.invoke(IPC_CHANNELS.permissionsRespond, { sessionId, requestId, decision }) as Promise<void>,
+  }),
+  questions: Object.freeze({
+    respond: (sessionId: string, questionId: string, answers: AgentQuestionResponse) =>
+      ipcRenderer.invoke(IPC_CHANNELS.questionsRespond, { sessionId, questionId, answers }) as Promise<void>,
   }),
   router: Object.freeze({
     preview: (task: string, projectId: string) =>

@@ -17,8 +17,8 @@ describe("default role profiles", () => {
     expect(profiles.map((profile) => profile.role)).toEqual([...ROLE_ORDER]);
     expect(profiles.every((profile) => ["codex", "claude"].includes(profile.agentId))).toBe(true);
     expect(profiles.find((profile) => profile.role === "high")?.agentId).toBe("claude");
-    expect(profiles.find((profile) => profile.role === "review")?.mode).toBe("review");
-    expect(profiles.find((profile) => profile.role === "planning")?.mode).toBe("plan");
+    // Mode is derived from the role at execution time, so seeding one would only invite it to disagree.
+    expect(profiles.every((profile) => profile.mode === undefined)).toBe(true);
   });
 
   it("prefers a usable provider over one that is installed but not authenticated", () => {

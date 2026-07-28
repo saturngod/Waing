@@ -5,6 +5,15 @@ export const permissionProfileSchema = z.enum([
 ]);
 export type PermissionProfile = z.infer<typeof permissionProfileSchema>;
 
+/**
+ * Role profiles store the id as a plain string, so rows saved before a name changed — or by an older build —
+ * must not break a run. Anything unrecognized falls back to asking, which is the only safe default.
+ */
+export function resolvePermissionProfile(value: string | undefined): PermissionProfile {
+  const parsed = permissionProfileSchema.safeParse(value);
+  return parsed.success ? parsed.data : "ask_before_changes";
+}
+
 export const permissionDecisionSchema = z.enum([
   "allow_once", "allow_session", "deny",
 ]);

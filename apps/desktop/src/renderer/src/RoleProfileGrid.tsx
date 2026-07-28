@@ -28,8 +28,8 @@ const ROLE_GROUPS: Array<{ title: string; hint: string; roles: WorkflowRole[] }>
 
 const EFFORT_OPTIONS: Array<[NonNullable<RoleExecutionProfile["effort"]>, string]> = [
   ["low", "Low"], ["medium", "Medium"], ["high", "High"], ["max", "Max"]];
-const MODE_OPTIONS: Array<[NonNullable<RoleExecutionProfile["mode"]>, string]> = [
-  ["execute", "Execute"], ["plan", "Plan"], ["review", "Review"], ["investigate", "Investigate"]];
+// No Mode column: mode restates the role. Planning plans, Review reviews, everything else executes, so the
+// workflow derives it from the node instead of letting a saved mode contradict the role it belongs to.
 const PERMISSION_OPTIONS: Array<[string, string]> = [["read_only", "Read only"], ["ask_before_changes", "Ask changes"],
   ["auto_edit", "Auto edit"], ["autonomous", "Autonomous"]];
 
@@ -128,11 +128,11 @@ export function RoleProfileGrid({ profiles, agents, onChange }: {
 
   return <div className="role-table-wrap">
     <table className="role-table">
-      {/* Stating the five field names once, above aligned columns, replaces repeating them on every role. */}
+      {/* Stating the four field names once, above aligned columns, replaces repeating them on every role. */}
       <thead><tr><th scope="col">Role</th><th scope="col">Agent</th><th scope="col">Model</th>
-        <th scope="col">Effort</th><th scope="col">Mode</th><th scope="col">Permissions</th></tr></thead>
+        <th scope="col">Effort</th><th scope="col">Permissions</th></tr></thead>
       {groups.map((group) => <tbody key={group.title}>
-        <tr className="role-group"><th colSpan={6} scope="colgroup">
+        <tr className="role-group"><th colSpan={5} scope="colgroup">
           <strong>{group.title}</strong><span>{group.hint}</span></th></tr>
         {group.rows.map(({ index, profile }) => {
           const label = ROLE_LABELS[profile.role];
@@ -150,10 +150,6 @@ export function RoleProfileGrid({ profiles, agents, onChange }: {
             <td data-label="Effort"><select value={profile.effort ?? "medium"} aria-label={`${label} effort`}
               onChange={(event) => onChange(index, { effort: event.target.value as RoleExecutionProfile["effort"] })}>
               {EFFORT_OPTIONS.map(([value, text]) => <option key={value} value={value}>{text}</option>)}
-            </select></td>
-            <td data-label="Mode"><select value={profile.mode ?? "execute"} aria-label={`${label} mode`}
-              onChange={(event) => onChange(index, { mode: event.target.value as RoleExecutionProfile["mode"] })}>
-              {MODE_OPTIONS.map(([value, text]) => <option key={value} value={value}>{text}</option>)}
             </select></td>
             <td data-label="Permissions"><select value={profile.permissionProfileId ?? "ask_before_changes"}
               aria-label={`${label} permissions`}

@@ -20,6 +20,20 @@ type ActivityEntry =
  */
 const SUPPRESSED: ReadonlySet<AgentEvent["type"]> = new Set(["usage.updated", "diff.updated"]);
 
+/**
+ * Workflow steps end their message with a shared-state amendment. The engine parses it out of the stored summary, but
+ * the live message events reach the transcript untouched, so the block is dropped here too — the plan it carries is
+ * shown as a plan in the inspector, never as raw JSON in the conversation.
+ */
+// Closed fence, then the two half-written forms a stream passes through: an open fence, and a bare object. The block
+// always ends the message, so an unterminated one runs to the end of what has arrived so far.
+//
+// The bare-object form also swallows a fence the model opened around it — providers routinely label the block
+// ```json, or leave it unlabelled, instead of ```waing-state. Without that, stripping the object took the closing
+// fence with it and left the opening one behind, which renders as an empty code block at the end of the message.
+const STATE_BLOCK = /```waing-state[\s\S]*?```|```waing-state[\s\S]*$|(?:```[\w-]*[^\S\r\n]*\r?\n\s*)?\{\s*"(?:planItems|decisions|openQuestions)"[\s\S]*$/gu;
+export function withoutStateBlock(text: string): string { return text.replace(STATE_BLOCK, "").trim(); }
+
 function activityText(event: AgentEvent): { title: string; detail?: string } {
   switch (event.type) {
     case "run.started": return { title: "Run started" };
@@ -34,6 +48,9 @@ function activityText(event: AgentEvent): { title: string; detail?: string } {
     case "tool.completed": return { title: `Finished ${event.tool}` };
     case "permission.requested": return { title: "Permission requested", detail: event.request.title };
     case "permission.resolved": return { title: "Permission", detail: event.decision.replaceAll("_", " ") };
+    case "question.requested": return { title: "Question", detail: event.question.questions[0]?.question ?? "" };
+    case "question.resolved": return { title: "Answered", detail: event.answers.length === 0 ? "Dismissed"
+      : event.answers.map((answer) => answer.values.join(", ")).join(" · ") };
     case "usage.updated": return { title: "Usage", detail: `${event.inputTokens} in · ${event.outputTokens} out` };
     case "run.completed": return event.summary === undefined ? { title: "Run completed" } : { title: "Run completed", detail: event.summary };
     case "run.failed": return { title: "Run failed", detail: event.message };
@@ -61,7 +78,9 @@ function buildChat(events: AgentEvent[], prompt: string | undefined): ChatItem[]
     }
     // Suppressed ticks arrive mid-stream, so they must not split the message they interleave with either.
     if (SUPPRESSED.has(event.type)) continue;
-    bubble = undefined;
+    // Not every provider ends a message with `message.completed` (OpenCode only streams deltas), so the next
+    // non-message event — a tool call, or `run.completed` — is what settles the bubble into rendered Markdown.
+    if (bubble !== undefined) { bubble.streaming = false; bubble = undefined; }
     if (activity === undefined) { activity = { kind: "activity", id: `activity-${event.id}`, entries: [], pending: true }; items.push(activity); }
     const previous = activity.entries.at(-1);
     if (event.type === "command.output") {
@@ -105,6 +124,8 @@ export function ActivityTimeline({ events, prompt, steps = [], model, effort, ag
 }) {
   const items = buildChat(events, prompt);
   const fallbackLabel = `Model: ${model ?? "Provider default"} · Effort: ${effort ?? "Provider default"}`;
+  // Both signals come from events, never from whether send() has returned: a single-agent run keeps streaming
+  // long after its send call resolves, so the transcript is what knows the work is still going.
   const working = items.some((item) => item.kind === "activity" && item.pending)
     || steps.some((step) => step.state === "pending");
 
@@ -113,12 +134,14 @@ export function ActivityTimeline({ events, prompt, steps = [], model, effort, ag
     if (item.kind === "assistant") {
       // Each workflow step can run a different provider, so prefer the model and effort announced for that agent.
       const label = agentMeta[item.agentId] ?? fallbackLabel;
+      const text = withoutStateBlock(item.text);
+      if (text.length === 0 && !item.streaming) return null;
       return <article className="chat-turn agent" key={item.id}>
         <div className="chat-author">{item.agentId}<span className="chat-meta">{label}</span></div>
         {/* Mid-stream text is often half a fence or table row, so it stays literal until the message settles. */}
         <div className="chat-text">{item.streaming
-          ? <>{item.text}<span className="caret" aria-label="Streaming" /></>
-          : <Markdown text={item.text} {...(projectId === undefined ? {} : { projectId })} />}</div>
+          ? <>{text}<span className="caret" aria-label="Streaming" /></>
+          : <Markdown text={text} {...(projectId === undefined ? {} : { projectId })} />}</div>
       </article>;
     }
     return <details className={`activity-group ${item.pending ? "pending" : "done"}`} key={item.id}>
@@ -144,7 +167,7 @@ export function ActivityTimeline({ events, prompt, steps = [], model, effort, ag
     {historyMessages.map((message) => message.role === "user"
       ? <article className="chat-turn user" key={message.id}><div className="bubble">{message.content}</div></article>
       : <article className="chat-turn agent" key={message.id}><div className="chat-author">assistant</div>
-        <div className="chat-text"><Markdown text={message.content} {...(projectId === undefined ? {} : { projectId })} /></div></article>)}
+        <div className="chat-text"><Markdown text={withoutStateBlock(message.content)} {...(projectId === undefined ? {} : { projectId })} /></div></article>)}
     {items.filter((item) => item.kind === "user").map(renderItem)}
     {/* Routing runs before the provider starts, so its steps sit between the prompt and the first provider event. */}
     {steps.map((step) => <div className={`chat-activity ${step.state ?? ""}`} key={step.id}>
@@ -155,7 +178,7 @@ export function ActivityTimeline({ events, prompt, steps = [], model, effort, ag
     </div>)}
     {/* Older runs stored only a summary message, with no message event to rebuild a bubble from. */}
     {replayText !== undefined && <article className="chat-turn agent"><div className="chat-author">summary</div>
-      <div className="chat-text"><Markdown text={replayText} {...(projectId === undefined ? {} : { projectId })} /></div></article>}
+      <div className="chat-text"><Markdown text={withoutStateBlock(replayText)} {...(projectId === undefined ? {} : { projectId })} /></div></article>}
     {items.filter((item) => item.kind !== "user").map(renderItem)}
     {working && <div className="task-loading" role="status" aria-label="Agent is working">
       <span className="task-loading-spinner" aria-hidden="true" /><span>Working</span>

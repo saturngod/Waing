@@ -3,6 +3,7 @@ import type {
   AgentEvent,
   AgentModelDescriptor,
   AgentRequest,
+  AgentQuestionResponse,
   AgentRun,
   AgentSession,
   PermissionDecision,
@@ -22,6 +23,12 @@ export interface CodingAgent {
     sessionId: string,
     requestId: string,
     decision: PermissionDecision,
+  ): Promise<void>;
+  /** Optional: only providers that can ask the user a multiple-choice question implement this. */
+  respondToQuestion?(
+    sessionId: string,
+    questionId: string,
+    answers: AgentQuestionResponse,
   ): Promise<void>;
   closeSession(sessionId: string): Promise<void>;
   shutdown(): Promise<void>;

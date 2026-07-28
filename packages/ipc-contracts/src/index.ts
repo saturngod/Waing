@@ -1,5 +1,5 @@
-import type { AgentDescriptor, AgentEvent, AgentModelDescriptor, AgentSession, AppConversation, AutoSelection, EffortLevel, ExecutionWorkflowRole, PermissionDecision, Project, RoleExecutionProfile, RoutingDecision, StepAnnouncement, WorkflowEvent } from "@waing/domain";
-import { roleExecutionProfileSchema } from "@waing/domain";
+import type { AgentDescriptor, AgentQuestionResponse, AgentEvent, AgentModelDescriptor, AgentSession, AppConversation, AutoSelection, EffortLevel, ExecutionWorkflowRole, PermissionDecision, Project, RoleExecutionProfile, RoutingDecision, StepAnnouncement, WorkflowEvent, WorkspaceFileMatches } from "@waing/domain";
+import { agentQuestionResponseSchema, roleExecutionProfileSchema } from "@waing/domain";
 import { z } from "zod";
 
 export { IPC_CHANNELS } from "./channels";
@@ -9,6 +9,9 @@ export const runFakeInputSchema = z.object({ text: z.string().min(1) });
 export const permissionResponseInputSchema = z.object({
   sessionId: z.string().min(1), requestId: z.string().min(1),
   decision: z.enum(["allow_once", "allow_session", "deny"]),
+});
+export const questionResponseInputSchema = z.object({
+  sessionId: z.string().min(1), questionId: z.string().min(1), answers: agentQuestionResponseSchema,
 });
 export const routerPreviewInputSchema = z.object({ task: z.string().min(1), projectId: z.string().min(1) });
 export const projectIdInputSchema = z.object({ projectId: z.string().min(1) });
@@ -22,6 +25,12 @@ export interface ConversationHistory {
   announcements: StepAnnouncement[];
 }
 export const agentModelsInputSchema = z.object({ agentId: z.string().min(1) });
+/**
+ * The `@` mention picker. It names a project, never a path: the renderer cannot point this at a directory of
+ * its choosing, and results stay inside whatever root that project was canonicalized to.
+ */
+export const fileSearchInputSchema = z.object({ projectId: z.string().min(1),
+  query: z.string().max(200), limit: z.number().int().min(1).max(50).optional() }).strict();
 export const openLinkInputSchema = z.object({ target: z.string().min(1).max(4_096), projectId: z.string().min(1).optional() }).strict();
 export const sessionSendInputSchema = z.object({ projectId: z.string().min(1), text: z.string().min(1),
   conversationId: z.string().min(1).optional(),
@@ -89,6 +98,7 @@ export interface DesktopApi {
     refresh(): Promise<AgentDescriptor[]>;
     models(agentId: string): Promise<AgentModelDescriptor[]>;
   };
+  files: { search(projectId: string, query: string, limit?: number): Promise<WorkspaceFileMatches> };
   attachments: {
     choose(): Promise<AttachmentChoice[]>;
     add(files: AttachmentUpload[]): Promise<AttachmentChoice[]>;
@@ -102,6 +112,9 @@ export interface DesktopApi {
   };
   permissions: {
     respond(sessionId: string, requestId: string, decision: PermissionDecision): Promise<void>;
+  };
+  questions: {
+    respond(sessionId: string, questionId: string, answers: AgentQuestionResponse): Promise<void>;
   };
   router: { preview(task: string, projectId: string): Promise<AutoSelection> };
   workflows: {

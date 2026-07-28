@@ -1,16 +1,21 @@
 import { chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import { AsyncQueue, ProcessSupervisor, RestartPolicy } from "@waing/agent-core";
 import type { AgentEvent, AgentRequest, PermissionDecision } from "@waing/domain";
 import { OpenCodeAdapter } from "./OpenCodeAdapter";
+import { SdkOpenCodeApi } from "./OpenCodeApi";
 import type { OpenCodeApi, OpenCodeModel } from "./OpenCodeApi";
 import { OpenCodeServer } from "./OpenCodeServer";
 
 class FakeApi implements OpenCodeApi {
   readonly stream = new AsyncQueue<unknown>();
   readonly permissionResponses: Array<{ requestId: string; decision: PermissionDecision }> = [];
+  readonly questionAnswers: Array<{ requestId: string; answers: string[][] }> = [];
+  readonly questionRejections: string[] = [];
   prompts: AgentRequest[] = [];
   aborts = 0;
 
@@ -20,6 +25,12 @@ class FakeApi implements OpenCodeApi {
   abort(): Promise<void> { this.aborts += 1; return Promise.resolve(); }
   respondToPermission(_root: string, _sessionId: string, requestId: string, decision: PermissionDecision): Promise<void> {
     this.permissionResponses.push({ requestId, decision }); return Promise.resolve();
+  }
+  respondToQuestion(_root: string, requestId: string, answers: string[][]): Promise<void> {
+    this.questionAnswers.push({ requestId, answers }); return Promise.resolve();
+  }
+  rejectQuestion(_root: string, requestId: string): Promise<void> {
+    this.questionRejections.push(requestId); return Promise.resolve();
   }
   events(_root: string, signal: AbortSignal): AsyncIterable<unknown> {
     signal.addEventListener("abort", () => this.stream.end(), { once: true }); return this.stream;
@@ -141,6 +152,101 @@ describe("OpenCodeAdapter", () => {
     expect(api.attempts).toBe(2);
     await adapter.shutdown();
   });
+
+  it("surfaces the question tool and answers it in the order OpenCode asked", async () => {
+    const api = new FakeApi();
+    const adapter = testAdapter(api);
+    const session = await adapter.startSession({ conversationId: "c", projectId: "p", projectRoot: "/tmp/project" });
+    const iterator = adapter.events(session.id)[Symbol.asyncIterator]();
+    await adapter.send(session.id, { text: "plan it", projectRoot: "/tmp/project", mode: "plan" });
+    api.stream.push({ type: "question.asked", properties: { id: "que-1", sessionID: "ses-1", questions: [
+      { question: "Which theme?", header: "Theme", options: [{ label: "Dark", description: "Dark background" },
+        { label: "Light", description: "Light background" }] },
+      { question: "Which stack?", header: "Stack", multiple: true, options: [{ label: "Static", description: "No build" }] },
+    ] } });
+    const events = await nextUntil(iterator, "question.requested");
+    expect(events.at(-1)).toMatchObject({ type: "question.requested", question: { id: "que-1", questions: [
+      { header: "Theme", options: [{ label: "Dark" }, { label: "Light" }] },
+      { header: "Stack", multiSelect: true },
+    ] } });
+    // The user answers only the second question; the first still needs a slot so the answers stay aligned.
+    await adapter.respondToQuestion(session.id, "que-1", [{ header: "Stack", values: ["Static"] }]);
+    expect(api.questionAnswers).toEqual([{ requestId: "que-1", answers: [[], ["Static"]] }]);
+    api.stream.push({ type: "session.idle", properties: { sessionID: "ses-1" } });
+    expect((await nextUntil(iterator, "run.completed")).map((event) => event.type))
+      .toEqual(["question.resolved", "run.completed"]);
+    await adapter.shutdown();
+  });
+
+  it("rejects a question it cannot show so the run is never left waiting on it", async () => {
+    const api = new FakeApi();
+    const adapter = testAdapter(api);
+    const session = await adapter.startSession({ conversationId: "c", projectId: "p", projectRoot: "/tmp/project" });
+    await adapter.send(session.id, { text: "plan it", projectRoot: "/tmp/project", mode: "plan" });
+    // No options at all: nothing the card could render, and the provider is blocked until it hears back.
+    api.stream.push({ type: "question.asked", properties: { id: "que-2", sessionID: "ses-1",
+      questions: [{ question: "Pick one", header: "Pick", options: [] }] } });
+    for (let attempt = 0; attempt < 50 && api.questionRejections.length === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    expect(api.questionRejections).toEqual(["que-2"]);
+    await adapter.shutdown();
+  });
+
+  it("names the server's exit reason instead of reporting a closed stream, and starts a fresh server after", async () => {
+    const api = new FakeApi();
+    // One flag per spawned server: a process that has exited never comes back, so only a new handle can be alive.
+    const spawned: Array<{ alive: boolean }> = [];
+    const adapter = new OpenCodeAdapter({
+      serverFactory: () => {
+        const server = { alive: true }; spawned.push(server);
+        return Promise.resolve({ baseUrl: "http://127.0.0.1:12345", password: "secret", version: "1.18.5",
+          isAlive: () => server.alive, close: () => Promise.resolve(),
+          exitReason: () => server.alive ? undefined : "exited with code 1: out of memory" });
+      },
+      apiFactory: () => api,
+      restartPolicy: new RestartPolicy({ maxAttempts: 3, baseDelayMs: 0, maxDelayMs: 0 }),
+    });
+    const session = await adapter.startSession({ conversationId: "c", projectId: "p", projectRoot: "/tmp" });
+    const iterator = adapter.events(session.id)[Symbol.asyncIterator]();
+    await adapter.send(session.id, { text: "build it", projectRoot: "/tmp", mode: "execute" });
+    // The SDK ends the stream cleanly when the process dies, which is exactly what a crash looks like from here.
+    spawned[0]!.alive = false; api.stream.end();
+    const events = await nextUntil(iterator, "run.failed");
+    expect(events.at(-1)).toMatchObject({ type: "run.failed", code: "LOCAL_SERVER_FAILED",
+      message: "OpenCode server exited with code 1: out of memory" });
+    // A dead server is never handed out again, so the next session starts a working one.
+    await adapter.startSession({ conversationId: "c2", projectId: "p", projectRoot: "/tmp" });
+    expect(spawned).toHaveLength(2);
+    await adapter.shutdown();
+  });
+});
+
+describe("SdkOpenCodeApi", () => {
+  it("authorizes the event stream, which the SDK opens outside the configured fetch", async () => {
+    const authHeaders: Array<string | undefined> = [];
+    const server = createServer((request, response) => {
+      authHeaders.push(request.headers.authorization);
+      // The real server answers 401 without credentials, and the SDK turns that into a stream that quietly ends.
+      if (request.headers.authorization === undefined) { response.writeHead(401); response.end(); return; }
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write(`data: ${JSON.stringify({ type: "server.connected", properties: {} })}\n\n`);
+    });
+    await new Promise<void>((resolve) => { server.listen(0, "127.0.0.1", resolve); });
+    const { port } = server.address() as AddressInfo;
+    const abort = new AbortController();
+    try {
+      const api = new SdkOpenCodeApi(`http://127.0.0.1:${String(port)}`, "secret");
+      for await (const event of api.events("/tmp/project", abort.signal)) {
+        expect(event).toMatchObject({ type: "server.connected" });
+        break;
+      }
+      expect(authHeaders).toEqual([`Basic ${Buffer.from("waing:secret").toString("base64")}`]);
+    } finally {
+      abort.abort(); server.closeAllConnections();
+      await new Promise<void>((resolve) => { server.close(() => { resolve(); }); });
+    }
+  }, 10_000);
 });
 
 describe("OpenCodeServer", () => {

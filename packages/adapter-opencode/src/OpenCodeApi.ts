@@ -14,6 +14,9 @@ export interface OpenCodeApi {
   prompt(root: string, id: string, request: AgentRequest): Promise<void>;
   abort(root: string, id: string): Promise<void>;
   respondToPermission(root: string, sessionId: string, requestId: string, decision: PermissionDecision): Promise<void>;
+  /** One entry per asked question, in the order they were asked, each holding the labels the user chose. */
+  respondToQuestion(root: string, requestId: string, answers: string[][]): Promise<void>;
+  rejectQuestion(root: string, requestId: string): Promise<void>;
   events(root: string, signal: AbortSignal): AsyncIterable<unknown>;
   listModels(root?: string): Promise<OpenCodeModel[]>;
 }
@@ -32,7 +35,11 @@ export class SdkOpenCodeApi implements OpenCodeApi {
       request.headers.set("authorization", authorization(password));
       return fetch(request);
     };
-    this.client = createOpencodeClient({ baseUrl, fetch: this.fetchImpl });
+    // The SDK's SSE client calls the global fetch directly, so a custom fetch never sees the event stream and the
+    // subscription is rejected with 401 — which surfaces as a stream that closes on its own. Configured headers do
+    // reach it, so authorization is declared here as well as wrapped in the fetch the plain requests use.
+    this.client = createOpencodeClient({ baseUrl, fetch: this.fetchImpl,
+      headers: { authorization: authorization(password) } });
   }
 
   async createSession(root: string, title: string): Promise<{ id: string }> {
@@ -64,11 +71,24 @@ export class SdkOpenCodeApi implements OpenCodeApi {
     root: string, _sessionId: string, requestId: string, decision: PermissionDecision,
   ): Promise<void> {
     const reply = decision === "deny" ? "reject" : decision === "allow_session" ? "always" : "once";
-    const url = new URL(`/permission/${encodeURIComponent(requestId)}/reply`, this.baseUrl);
+    await this.post(`/permission/${encodeURIComponent(requestId)}/reply`, root, "permission response", { reply });
+  }
+
+  // The pinned SDK has no question client — the ask-the-user tool is newer than it — so these two are posted directly.
+  async respondToQuestion(root: string, requestId: string, answers: string[][]): Promise<void> {
+    await this.post(`/question/${encodeURIComponent(requestId)}/reply`, root, "question answer", { answers });
+  }
+
+  async rejectQuestion(root: string, requestId: string): Promise<void> {
+    await this.post(`/question/${encodeURIComponent(requestId)}/reject`, root, "question rejection");
+  }
+
+  private async post(path: string, root: string, label: string, body?: unknown): Promise<void> {
+    const url = new URL(path, this.baseUrl);
     url.searchParams.set("directory", root);
     const response = await this.fetchImpl(url, { method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ reply }) });
-    if (!response.ok) throw new Error(`OpenCode permission response failed with HTTP ${String(response.status)}`);
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+    if (!response.ok) throw new Error(`OpenCode ${label} failed with HTTP ${String(response.status)}`);
   }
 
   async *events(root: string, signal: AbortSignal): AsyncIterable<Event> {

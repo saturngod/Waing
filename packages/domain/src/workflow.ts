@@ -164,6 +164,9 @@ export const routerCheckpointInputSchema = z.object({ checkpointReason: routerCh
   latestArtifact: workflowArtifactRefSchema.optional(), priorStepSummaries: z.array(stepSummaryEntrySchema),
   artifacts: z.array(workflowArtifactRefSchema), unresolvedIssues: z.array(z.string()), reviewIteration: z.number().int().min(0).optional(),
   omittedStepCount: z.number().int().min(0).optional(),
+  /** The run's plan, decisions, and open questions. "Is anything left?" is answered from here, not from prose
+   * summaries that compaction is free to drop. */
+  sharedState: workflowSharedStateSchema.optional(),
   allowedActions: z.array(workflowNextActionKindSchema).min(1) }).strict();
 export type RouterCheckpointInput = z.infer<typeof routerCheckpointInputSchema>;
 export const routerOrchestrationDecisionSchema = z.object({ action: workflowNextActionKindSchema,
@@ -206,6 +209,8 @@ export type WorkflowEvent =
   | { type: "workflow.step.announced"; announcement: StepAnnouncement }
   | { type: "workflow.node.started"; nodeId: string; stepRunId: string }
   | { type: "workflow.node.completed"; nodeId: string; stepRunId: string }
+  /** The run's plan after a step amended it, so the renderer can show the plan instead of the raw state block. */
+  | { type: "workflow.state.updated"; sharedState: WorkflowSharedState }
   | { type: "workflow.route.selected"; role: z.infer<typeof workflowRoleSchema> }
   | { type: "workflow.review.completed"; verdict: "pass" | "fail" }
   | { type: "workflow.loop.iteration"; loopId: string; iteration: number }

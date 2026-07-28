@@ -89,6 +89,8 @@ export class WorkflowEngine {
           ...(node.type === "document" ? { documentInput: this.documentInput(context, node) } : {}),
           signal: this.controller.signal });
         await store.recordStep(context, result);
+        // The merged state, not the step's amendment: the renderer shows the whole plan, and a step only sends deltas.
+        if (result.stateUpdate !== undefined) this.events.publish({ type: "workflow.state.updated", sharedState: structuredClone(context.sharedState) });
         if (result.providerSessionId !== undefined) context.providerSessions[profile.agentId] = result.providerSessionId;
         for (const artifact of result.artifacts) this.events.publish({ type: "workflow.artifact.created", artifactId: artifact.id });
         if (result.status !== "completed") throw new AgentError(result.status === "cancelled" ? "CANCELLED" : "PROCESS_FAILED",
@@ -140,6 +142,8 @@ export class WorkflowEngine {
       priorStepSummaries: history.summaries, artifacts: context.artifacts,
       ...(history.omittedStepCount === 0 ? {} : { omittedStepCount: history.omittedStepCount }),
       unresolvedIssues: dedupe(context.stepResults.flatMap((result) => result.unresolvedIssues ?? [])),
+      // The plan is what "is there anything next?" is answered from, so it goes to the router whole.
+      ...(this.hasSharedState(context) ? { sharedState: context.sharedState } : {}),
       reviewIteration: Object.values(context.loopState)[0]?.iteration ?? 0, allowedActions: node.allowedActions });
     const decision = routerOrchestrationDecisionSchema.parse(await this.router.decideNext(checkpoint));
     if (!node.allowedActions.includes(decision.action)) throw new AgentError("ROUTER_INVALID_OUTPUT",

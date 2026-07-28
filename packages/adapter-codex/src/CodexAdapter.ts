@@ -5,14 +5,16 @@ import {
 import type { CodingAgent, ManagedProcess } from "@waing/agent-core";
 import { AgentError } from "@waing/domain";
 import type {
-  AgentDescriptor, AgentEvent, AgentModelDescriptor, AgentRequest, AgentRun, AgentSession,
-  PermissionDecision, ResumeSessionInput, StartSessionInput,
+  AgentDescriptor, AgentEvent, AgentModelDescriptor, AgentQuestionItem, AgentQuestionResponse, AgentRequest,
+  AgentRun, AgentSession, PermissionDecision, ResumeSessionInput, StartSessionInput,
 } from "@waing/domain";
 import type { ModelListResponse } from "../generated/v2/ModelListResponse";
 import type { ThreadResumeResponse } from "../generated/v2/ThreadResumeResponse";
 import type { ThreadStartResponse } from "../generated/v2/ThreadStartResponse";
 import type { TurnStartResponse } from "../generated/v2/TurnStartResponse";
 import type { ThreadItem } from "../generated/v2/ThreadItem";
+import type { ToolRequestUserInputParams } from "../generated/v2/ToolRequestUserInputParams";
+import type { ToolRequestUserInputResponse } from "../generated/v2/ToolRequestUserInputResponse";
 import type { UserInput } from "../generated/v2/UserInput";
 
 interface SessionState {
@@ -26,7 +28,32 @@ interface SessionState {
 interface PendingApproval {
   sessionId: string;
   resolve: (result: Record<string, unknown>) => void;
-  kind: "command" | "file";
+  kind: "command" | "file" | "permissions";
+  /** Each approval family answers in its own shape, so the user's decision is translated per request. */
+  toResponse: (decision: PermissionDecision) => Record<string, unknown>;
+}
+
+/** The shape the per-item requestApproval methods and the legacy v1 approvals both answer in. */
+const reviewDecision = (decision: PermissionDecision): Record<string, unknown> => ({
+  decision: decision === "deny" ? "decline" : decision === "allow_session" ? "acceptForSession" : "accept",
+});
+
+/**
+ * Codex only offers its ask-the-user tool when the client opts in twice: the tool itself is experimental, and it is
+ * gated again to plan mode unless the default-mode feature is on. Without both, the model reports the tool as
+ * "unavailable in this mode" and answers its own question instead of asking — so a Codex step never stops for the
+ * user the way a Claude or OpenCode step does.
+ */
+const THREAD_CONFIG = {
+  "tools.experimental_request_user_input": { enabled: true },
+  "features.default_mode_request_user_input": true,
+};
+
+/** Codex keys its answers by question id, so the ids are kept beside the headers the app answers with. */
+interface PendingQuestion {
+  sessionId: string;
+  questionIds: Record<string, string>;
+  resolve: (result: ToolRequestUserInputResponse) => void;
 }
 
 type EventBaseKeys = "id" | "sessionId" | "runId" | "agentId" | "timestamp" | "sequence";
@@ -47,6 +74,7 @@ export class CodexAdapter implements CodingAgent {
   private readonly executable: string;
   private readonly sessions = new Map<string, SessionState>();
   private readonly approvals = new Map<string, PendingApproval>();
+  private readonly questions = new Map<string, PendingQuestion>();
   private transport?: JsonRpcTransport;
   private process?: ManagedProcess;
   private resolvedExecutable?: string;
@@ -89,7 +117,7 @@ export class CodexAdapter implements CodingAgent {
   async startSession(input: StartSessionInput): Promise<AgentSession> {
     const transport = await this.ensureTransport();
     const response = await transport.request<ThreadStartResponse>("thread/start", {
-      cwd: input.projectRoot, approvalPolicy: "on-request", sandbox: "workspace-write",
+      cwd: input.projectRoot, approvalPolicy: "on-request", sandbox: "workspace-write", config: THREAD_CONFIG,
     });
     return this.recordSession(input, response.thread.id);
   }
@@ -98,7 +126,7 @@ export class CodexAdapter implements CodingAgent {
     const transport = await this.ensureTransport();
     const response = await transport.request<ThreadResumeResponse>("thread/resume", {
       threadId: input.providerSessionId, cwd: input.projectRoot,
-      approvalPolicy: "on-request", sandbox: "workspace-write",
+      approvalPolicy: "on-request", sandbox: "workspace-write", config: THREAD_CONFIG,
     });
     return this.recordSession(input, response.thread.id);
   }
@@ -127,6 +155,7 @@ export class CodexAdapter implements CodingAgent {
 
   async cancel(sessionId: string): Promise<void> {
     const state = this.requireSession(sessionId);
+    this.releaseQuestions(sessionId);
     if (state.activeTurnId === undefined) return;
     const transport = await this.ensureTransport();
     await transport.request("turn/interrupt", {
@@ -140,16 +169,32 @@ export class CodexAdapter implements CodingAgent {
       throw new AgentError("SESSION_NOT_FOUND", `Unknown Codex approval: ${requestId}`, this.id);
     }
     this.approvals.delete(requestId);
-    const mapped = decision === "deny" ? "decline" : decision === "allow_session" ? "acceptForSession" : "accept";
-    pending.resolve({ decision: mapped });
+    pending.resolve(pending.toResponse(decision));
     this.emit(sessionId, this.requireSession(sessionId).activeTurnId ?? requestId, {
       type: "permission.resolved", requestId, decision,
     });
     return Promise.resolve();
   }
 
+  respondToQuestion(sessionId: string, questionId: string, answers: AgentQuestionResponse): Promise<void> {
+    const pending = this.questions.get(questionId);
+    if (pending === undefined || pending.sessionId !== sessionId) {
+      throw new AgentError("SESSION_NOT_FOUND", `Unknown Codex question: ${questionId}`, this.id);
+    }
+    this.questions.delete(questionId);
+    pending.resolve({ answers: Object.fromEntries(answers.flatMap((answer) => {
+      const id = pending.questionIds[answer.header];
+      return id === undefined ? [] : [[id, { answers: answer.values }] as const];
+    })) });
+    this.emit(sessionId, this.requireSession(sessionId).activeTurnId ?? questionId, {
+      type: "question.resolved", questionId, answers,
+    });
+    return Promise.resolve();
+  }
+
   async closeSession(sessionId: string): Promise<void> {
     const state = this.requireSession(sessionId);
+    this.releaseQuestions(sessionId);
     this.sessions.delete(sessionId);
     state.queue.end();
     if (this.transport !== undefined) {
@@ -183,7 +228,9 @@ export class CodexAdapter implements CodingAgent {
     this.bindProtocol(this.transport);
     await this.transport.request("initialize", {
       clientInfo: { name: "waing", title: "Waing", version: "0.1.0" },
-      capabilities: { experimentalApi: false },
+      // The ask-the-user tool is an experimental method, so declining experimental API means declining questions.
+      // Attestation stays off: it is a separate opt-in whose request this client has no way to satisfy.
+      capabilities: { experimentalApi: true, requestAttestation: false },
     });
     this.transport.notify("initialized", {});
     return this.transport;
@@ -201,6 +248,13 @@ export class CodexAdapter implements CodingAgent {
     }
     transport.handle("item/commandExecution/requestApproval", (params) => this.awaitApproval("command", params));
     transport.handle("item/fileChange/requestApproval", (params) => this.awaitApproval("file", params));
+    transport.handle("item/tool/requestUserInput", (params) => this.awaitAnswer(params));
+    transport.handle("item/permissions/requestApproval", (params) => this.awaitPermissions(params));
+    // Codex blocks the turn on every server request it sends. Answering the rest — rather than letting the transport
+    // reply "method not found" — is what keeps an unsupported ask from failing a run that was otherwise fine.
+    transport.handle("mcpServer/elicitation/request", (params) => this.declineElicitation(params));
+    transport.handle("applyPatchApproval", (params) => this.awaitApproval("file", params));
+    transport.handle("execCommandApproval", (params) => this.awaitApproval("command", params));
   }
 
   private handleNotification(method: string, raw: unknown): void {
@@ -259,6 +313,36 @@ export class CodexAdapter implements CodingAgent {
     }
   }
 
+  /** A parked question holds a JSON-RPC request open; leaving one behind would hang the turn past cancellation. */
+  private releaseQuestions(sessionId: string): void {
+    for (const [questionId, pending] of this.questions) {
+      if (pending.sessionId !== sessionId) continue;
+      this.questions.delete(questionId);
+      pending.resolve({ answers: {} });
+    }
+  }
+
+  /** Codex's own AskUserQuestion equivalent. Left unhandled the transport answers "Method not found" and the
+   * question is lost, so it is surfaced through the same question events the app already renders. */
+  private awaitAnswer(raw: unknown): Promise<ToolRequestUserInputResponse> {
+    const params = raw as ToolRequestUserInputParams;
+    const state = [...this.sessions.values()].find((candidate) => candidate.providerThreadId === params.threadId);
+    const questionIds: Record<string, string> = {};
+    const questions = (params.questions ?? []).flatMap((entry): AgentQuestionItem[] => {
+      const options = (entry.options ?? []).filter((option) => option.label.length > 0);
+      if (entry.question.length === 0 || options.length === 0) return [];
+      const header = entry.header.length > 0 ? entry.header : entry.question.slice(0, 12);
+      questionIds[header] = entry.id;
+      return [{ question: entry.question, header, options }];
+    }).slice(0, 4);
+    if (state === undefined || questions.length === 0) return Promise.resolve({ answers: {} });
+    const questionId = stringValue(params.itemId, randomUUID());
+    const runId = stringValue(params.turnId, state.activeTurnId ?? questionId);
+    this.emit(state.session.id, runId, { type: "question.requested",
+      question: { id: questionId, sessionId: state.session.id, runId, agentId: this.id, questions } });
+    return new Promise((resolve) => this.questions.set(questionId, { sessionId: state.session.id, questionIds, resolve }));
+  }
+
   private awaitApproval(kind: "command" | "file", raw: unknown): Promise<Record<string, unknown>> {
     const params = raw as Record<string, unknown>;
     const state = [...this.sessions.values()].find((candidate) =>
@@ -273,7 +357,49 @@ export class CodexAdapter implements CodingAgent {
         title: kind === "command" ? "Run command" : "Apply file changes",
         detail: stringValue(params.reason, stringValue(params.command, "Codex requests approval")), risk: "medium" },
     });
-    return new Promise((resolve) => this.approvals.set(requestId, { sessionId: state.session.id, resolve, kind }));
+    return new Promise((resolve) => this.approvals.set(requestId,
+      { sessionId: state.session.id, resolve, kind, toResponse: reviewDecision }));
+  }
+
+  /**
+   * Codex asking to widen the sandbox — network access, or a directory outside the workspace. Denying grants an
+   * empty profile rather than declining the turn, so the model carries on with what it already had.
+   */
+  private awaitPermissions(raw: unknown): Promise<Record<string, unknown>> {
+    const params = raw as { threadId?: unknown; turnId?: unknown; itemId?: unknown; reason?: unknown;
+      permissions?: { network?: unknown; fileSystem?: unknown } };
+    const state = [...this.sessions.values()].find((candidate) =>
+      candidate.providerThreadId === stringValue(params.threadId));
+    if (state === undefined) return Promise.resolve({ permissions: {}, scope: "turn" });
+    const profile = params.permissions ?? {};
+    const granted = { ...(profile.network == null ? {} : { network: profile.network }),
+      ...(profile.fileSystem == null ? {} : { fileSystem: profile.fileSystem }) };
+    const requestId = stringValue(params.itemId, randomUUID());
+    const runId = stringValue(params.turnId, state.activeTurnId ?? requestId);
+    this.emit(state.session.id, runId, { type: "permission.requested",
+      request: { id: requestId, sessionId: state.session.id, runId, agentId: this.id,
+        kind: profile.network == null ? "external_directory" : "network",
+        title: profile.network == null ? "Access files outside the workspace" : "Access the network",
+        detail: stringValue(params.reason, JSON.stringify(granted)), risk: "high" } });
+    return new Promise((resolve) => this.approvals.set(requestId, { sessionId: state.session.id, resolve,
+      kind: "permissions", toResponse: (decision) => decision === "deny" ? { permissions: {}, scope: "turn" }
+        : { permissions: granted, scope: decision === "allow_session" ? "session" : "turn" } }));
+  }
+
+  /**
+   * An MCP server asking the user to fill in an arbitrary JSON-schema form. The app has no renderer for one, and a
+   * request left unanswered stalls the turn, so it is declined — which is what the server's protocol expects.
+   */
+  private declineElicitation(raw: unknown): Promise<Record<string, unknown>> {
+    const params = raw as { threadId?: unknown; turnId?: unknown; serverName?: unknown; message?: unknown };
+    const state = [...this.sessions.values()].find((candidate) =>
+      candidate.providerThreadId === stringValue(params.threadId));
+    if (state !== undefined) {
+      const runId = stringValue(params.turnId, state.activeTurnId ?? randomUUID());
+      this.emit(state.session.id, runId, { type: "tool.progress", tool: stringValue(params.serverName, "mcp"),
+        detail: `Declined a form request: ${stringValue(params.message, "no message")}` });
+    }
+    return Promise.resolve({ action: "decline", content: null, _meta: null });
   }
 
   private recordSession(input: StartSessionInput, providerThreadId: string): AgentSession {

@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { AsyncQueue, RestartPolicy, providerCompatibility } from "@waing/agent-core";
 import type { CodingAgent } from "@waing/agent-core";
-import { AgentError } from "@waing/domain";
+import { AgentError, agentQuestionSchema } from "@waing/domain";
 import type {
-  AgentDescriptor, AgentEvent, AgentModelDescriptor, AgentRequest, AgentRun, AgentSession,
+  AgentDescriptor, AgentEvent, AgentModelDescriptor, AgentQuestionResponse, AgentRequest, AgentRun, AgentSession,
   PermissionDecision, ResumeSessionInput, StartSessionInput,
 } from "@waing/domain";
 import { SdkOpenCodeApi } from "./OpenCodeApi";
@@ -22,6 +22,8 @@ interface SessionState {
   assistantMessages: Set<string>;
   textByPart: Map<string, string>;
   toolStatus: Map<string, string>;
+  /** Pending question requests, holding each one's headers in the order OpenCode asked them. */
+  questionHeaders: Map<string, string[]>;
   activeRunId?: string;
 }
 
@@ -108,6 +110,22 @@ export class OpenCodeAdapter implements CodingAgent {
     this.emit(state, state.activeRunId ?? requestId, { type: "permission.resolved", requestId, decision });
   }
 
+  /**
+   * OpenCode expects one answer per question in the order it asked them, while the app answers by header. Anything
+   * the user left unanswered — including questions past the four the card shows — goes back as an empty selection.
+   */
+  async respondToQuestion(sessionId: string, questionId: string, answers: AgentQuestionResponse): Promise<void> {
+    const state = this.requireSession(sessionId);
+    const headers = state.questionHeaders.get(questionId);
+    if (headers === undefined) throw new AgentError("PROTOCOL_ERROR", `Unknown OpenCode question: ${questionId}`, this.id);
+    state.questionHeaders.delete(questionId);
+    const api = await this.ensureBackend();
+    if (answers.length === 0) await api.rejectQuestion(state.root, questionId);
+    else await api.respondToQuestion(state.root, questionId,
+      headers.map((header) => answers.find((answer) => answer.header === header)?.values ?? []));
+    this.emit(state, state.activeRunId ?? questionId, { type: "question.resolved", questionId, answers });
+  }
+
   closeSession(sessionId: string): Promise<void> {
     const state = this.requireSession(sessionId);
     state.abort.abort(); state.queue.end(); this.sessions.delete(sessionId);
@@ -124,6 +142,9 @@ export class OpenCodeAdapter implements CodingAgent {
   events(sessionId: string): AsyncIterable<AgentEvent> { return this.requireSession(sessionId).queue; }
 
   private async ensureBackend(): Promise<OpenCodeApi> {
+    // A crashed server keeps answering from every cached reference — with a closed socket. Drop it and start a new
+    // one, or every later call re-fails against a process that is not there.
+    if (this.api !== undefined && this.handle?.isAlive?.() === false) { delete this.api; delete this.handle; }
     if (this.api !== undefined) return this.api;
     this.handle = this.options.serverFactory === undefined ? await this.server.start() : await this.options.serverFactory();
     if (!this.isCompatible(this.handle.version)) {
@@ -140,7 +161,8 @@ export class OpenCodeAdapter implements CodingAgent {
     const session: AgentSession = { id: randomUUID(), conversationId: input.conversationId,
       providerSessionId, agentId: this.id, projectId: input.projectId, createdAt: now, updatedAt: now, status: "idle" };
     const state: SessionState = { session, root: input.projectRoot, queue: new AsyncQueue(), sequence: 0,
-      abort: new AbortController(), assistantMessages: new Set(), textByPart: new Map(), toolStatus: new Map() };
+      abort: new AbortController(), assistantMessages: new Set(), textByPart: new Map(), toolStatus: new Map(),
+      questionHeaders: new Map() };
     this.sessions.set(session.id, state);
     void this.consumeEvents(state);
     return session;
@@ -159,10 +181,14 @@ export class OpenCodeAdapter implements CodingAgent {
         failure = new Error("OpenCode event stream closed unexpectedly");
       } catch (cause) { failure = cause; }
       if (state.abort.signal.aborted) return;
+      // The SDK ends the stream cleanly when the server dies, so a closed stream says nothing by itself. Whether the
+      // process is still there is what separates a reconnect from a run that has lost its provider.
+      const died = this.handle?.isAlive?.() === false ? this.handle.exitReason?.() : undefined;
       failedAttempts += 1;
-      if (!policy.canRetry(failedAttempts)) {
-        if (state.activeRunId !== undefined) this.fail(state, "LOCAL_SERVER_FAILED",
-          failure instanceof Error ? failure.message : "OpenCode event stream failed");
+      if (died !== undefined || !policy.canRetry(failedAttempts)) {
+        if (state.activeRunId !== undefined) this.fail(state, "LOCAL_SERVER_FAILED", died === undefined
+          ? failure instanceof Error ? failure.message : "OpenCode event stream failed"
+          : `OpenCode server ${died}`);
         return;
       }
       await new Promise((resolve) => setTimeout(resolve, policy.delayMs(failedAttempts)));
@@ -191,6 +217,11 @@ export class OpenCodeAdapter implements CodingAgent {
     const sessionId = properties.sessionID;
     if (sessionId !== providerSessionId) return;
     if (event.type === "permission.updated" || event.type === "permission.asked") this.permission(state, properties);
+    // The ask-the-user tool ships as both `question.*` and `question.v2.*`; the payloads are the same shape.
+    else if (event.type === "question.asked" || event.type === "question.v2.asked") this.question(state, properties);
+    else if (event.type.startsWith("question.") && (event.type.endsWith(".replied") || event.type.endsWith(".rejected"))) {
+      this.questionSettled(state, properties);
+    }
     else if (event.type === "session.idle") this.complete(state);
     else if (event.type === "session.error") this.fail(state, "PROTOCOL_ERROR", this.errorMessage(properties.error));
     else if (event.type === "session.diff") this.emitActive(state, { type: "diff.updated", diff: JSON.stringify(properties.diff ?? []) });
@@ -242,6 +273,48 @@ export class OpenCodeAdapter implements CodingAgent {
       runId: state.activeRunId ?? requestId, agentId: this.id, kind,
       title: typeof properties.title === "string" ? properties.title : `OpenCode requests ${action}`,
       detail, risk: kind === "shell" || kind === "external_directory" ? "high" : "medium" } });
+  }
+
+  /**
+   * OpenCode's question tool blocks the run until the request is answered or rejected, so a question that never
+   * reaches the user is a run that never ends. The provider's own shape already matches the app's, apart from its
+   * `multiple` flag, so it only needs renaming.
+   */
+  private question(state: SessionState, properties: Record<string, unknown>): void {
+    const requestId = properties.id;
+    const asked = properties.questions;
+    if (typeof requestId !== "string" || !Array.isArray(asked)) return;
+    const items = asked.map((entry) => {
+      const item = entry as { question?: unknown; header?: unknown; multiple?: unknown; options?: unknown };
+      return { question: typeof item.question === "string" ? item.question : "",
+        header: typeof item.header === "string" ? item.header : "",
+        ...(item.multiple === true ? { multiSelect: true } : {}),
+        options: (Array.isArray(item.options) ? item.options : []).map((raw) => {
+          const option = raw as { label?: unknown; description?: unknown };
+          return { label: typeof option.label === "string" ? option.label : "",
+            description: typeof option.description === "string" ? option.description : "" };
+        }) };
+    });
+    // Every question is answered positionally, so the full order is kept even when the card can only show four.
+    state.questionHeaders.set(requestId, items.map((item) => item.header));
+    const question = agentQuestionSchema.safeParse({ id: requestId, sessionId: state.session.id,
+      runId: state.activeRunId ?? requestId, agentId: this.id, questions: items.slice(0, 4) });
+    if (!question.success) { void this.rejectQuestion(state, requestId); return; }
+    this.emitActive(state, { type: "question.requested", question: question.data });
+  }
+
+  private questionSettled(state: SessionState, properties: Record<string, unknown>): void {
+    const requestId = properties.requestID;
+    if (typeof requestId !== "string" || !state.questionHeaders.has(requestId)) return;
+    state.questionHeaders.delete(requestId);
+    this.emitActive(state, { type: "question.resolved", questionId: requestId, answers: [] });
+  }
+
+  private async rejectQuestion(state: SessionState, requestId: string): Promise<void> {
+    state.questionHeaders.delete(requestId);
+    // A question the app cannot render must still be answered, or OpenCode waits on it for the rest of the run.
+    try { await (await this.ensureBackend()).rejectQuestion(state.root, requestId); }
+    catch { /* the run's own failure will say more than a rejection that could not be delivered */ }
   }
 
   private complete(state: SessionState): void {

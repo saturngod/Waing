@@ -13,4 +13,5 @@ export * from "./Redaction";
 export * from "./RestartPolicy";
 export * from "./SessionCoordinator";
 export * from "./VersionProbe";
+export * from "./WorkspaceFileIndex";
 export * from "./WorkspacePathGuard";
