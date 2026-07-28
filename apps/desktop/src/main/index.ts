@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { realpath, writeFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import { AgentManager, PermissionManager, canonicalizeWorkspaceRoot, redactSensitiveData } from "@waing/agent-core";
 import { CodexAdapter } from "@waing/adapter-codex";
@@ -15,9 +15,9 @@ import type { GlobalRoleProfiles } from "@waing/workflow";
 import { PersistenceStore, SqliteDatabase, SqliteWorkflowRepository } from "@waing/persistence";
 import { IPC_CHANNELS, agentModelsInputSchema, conversationIdInputSchema, conversationRemoveInputSchema, emptyInputSchema,
   permissionResponseInputSchema, projectIdInputSchema, roleProfilesInputSchema, routerPreviewInputSchema, runFakeInputSchema,
-  sessionCancelInputSchema, sessionSendInputSchema, workflowRunInputSchema } from "@waing/ipc-contracts";
-import type { ConversationHistory, RoleProfilesView, SessionSendResult } from "@waing/ipc-contracts";
-import type { AgentDescriptor, AppConversation, Project, RoleExecutionProfile } from "@waing/domain";
+  sessionCancelInputSchema, sessionSendInputSchema, workflowRunInputSchema, openLinkInputSchema } from "@waing/ipc-contracts";
+import type { AttachmentChoice, ConversationHistory, RoleProfilesView, SessionSendResult } from "@waing/ipc-contracts";
+import type { AgentDescriptor, AgentRequest, AppConversation, Project, RoleExecutionProfile } from "@waing/domain";
 import { FakeAgent } from "./FakeAgent";
 import { SecretStore } from "./SecretStore";
 
@@ -25,16 +25,36 @@ const projects = new Map<string, Project>();
 const agentManager = new AgentManager();
 const permissionManager = new PermissionManager();
 const assistantBuffers = new Map<string, string>();
+const selectedAttachments = new Map<string, AttachmentChoice & { path: string }>();
 const trustedWebContents = new Set<number>();
 let database: SqliteDatabase | undefined;
 let persistence: PersistenceStore | undefined;
 let workflowRepository: SqliteWorkflowRepository | undefined;
 let secretStore: SecretStore | undefined;
-let activeChatRun: { id: string; engine: WorkflowEngine } | undefined;
+const activeChatRuns = new Map<string, WorkflowEngine>();
 /** Routing runs are internal: their events must not reach the transcript as if an agent were answering the user. */
 const routerSessionIds = new Set<string>();
 const ROUTER_TIMEOUT_MS = 90_000;
 let contentSecurityPolicyConfigured = false;
+
+const IMAGE_MIME_TYPES: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+  ".gif": "image/gif", ".webp": "image/webp", ".heic": "image/heic", ".svg": "image/svg+xml" };
+function attachmentMimeType(path: string): string {
+  return IMAGE_MIME_TYPES[extname(path).toLocaleLowerCase()] ?? "application/octet-stream";
+}
+function takeAttachments(ids: readonly string[] | undefined): Array<AttachmentChoice & { path: string }> {
+  if (ids === undefined) return [];
+  return ids.map((id) => {
+    const attachment = selectedAttachments.get(id);
+    if (attachment === undefined) throw new Error("Choose the attachment again before sending");
+    return attachment;
+  });
+}
+function taskWithAttachments(text: string, attachments: ReadonlyArray<AttachmentChoice & { path: string }>): string {
+  if (attachments.length === 0) return text;
+  const references = attachments.map((item) => `- ${item.name.replaceAll(/[\r\n]/g, " ")} (${item.mimeType}): ${item.path}`);
+  return `${text}\n\nUser-selected attachments:\n${references.join("\n")}\nUse these files as task context.`;
+}
 export function getSecretStore(): SecretStore {
   if (secretStore === undefined) throw new Error("Secret storage is not initialized");
   return secretStore;
@@ -107,12 +127,15 @@ async function resolveRoleProfiles(): Promise<RoleProfilesView> {
   const stored = persistence?.listRoleProfiles("global", "default") ?? [];
   const configured = persistence?.getSetting<boolean>(ROUTING_CONFIGURED_SETTING) === true;
   const acknowledged = persistence?.getSetting<boolean>(ROUTING_ACKNOWLEDGED_SETTING) === true;
-  if (stored.length === ROLE_ORDER.length) {
+  const storedRoles = new Set(stored.map((profile) => profile.role));
+  if (stored.length === ROLE_ORDER.length && ROLE_ORDER.every((role) => storedRoles.has(role))) {
     return { profiles: sortRoleProfiles(stored), needsReview: !configured && !acknowledged };
   }
   const seeded = buildDefaultRoleProfiles(await agentManager.discoverAll());
-  for (const profile of seeded) persistence?.saveRoleProfile("global", "default", profile);
-  return { profiles: seeded, needsReview: !acknowledged };
+  const existing = new Map(stored.map((profile) => [profile.role, profile]));
+  const migrated = seeded.map((profile) => existing.get(profile.role) ?? profile);
+  for (const profile of migrated) persistence?.saveRoleProfile("global", "default", profile);
+  return { profiles: migrated, needsReview: !configured && !acknowledged };
 }
 
 /**
@@ -120,7 +143,8 @@ async function resolveRoleProfiles(): Promise<RoleProfilesView> {
  * that switches every tool off at the protocol level; any other provider runs the routing prompt through its own
  * adapter. Passing a model that belongs to one provider to a different one is what made a non-OpenCode router hang.
  */
-function createRouterClient(profile: RoleExecutionProfile | undefined, project: Project): RouterClient & { shutdown(): Promise<void> } {
+function createRouterClient(profile: RoleExecutionProfile | undefined, project: Project,
+  onRouterSession?: (sessionId: string) => void): RouterClient & { shutdown(): Promise<void> } {
   const model = profile?.modelId;
   // "default" is a placeholder some model lists expose; it must never be forwarded as a real model id.
   const usableModel = model === undefined || model === "default" ? undefined : model;
@@ -129,7 +153,7 @@ function createRouterClient(profile: RoleExecutionProfile | undefined, project: 
   }
   return new AgentRouterClient({ agents: agentManager, agentId: profile.agentId, projectId: project.id,
     projectRoot: project.root, ...(usableModel === undefined ? {} : { model: usableModel }),
-    onSession: (sessionId) => routerSessionIds.add(sessionId) });
+    onSession: (sessionId) => { routerSessionIds.add(sessionId); onRouterSession?.(sessionId); } });
 }
 
 /**
@@ -137,19 +161,21 @@ function createRouterClient(profile: RoleExecutionProfile | undefined, project: 
  * Step providers, models, and efforts come from the saved role profiles, and every engine event is forwarded to the
  * renderer so the chat transcript shows each agent as it starts.
  */
-async function runChatWorkflow(project: Project, task: string): Promise<SessionSendResult> {
+async function runChatWorkflow(project: Project, task: string, workflowTask = task): Promise<SessionSendResult> {
   const { profiles } = await resolveRoleProfiles();
   await assertRolesUsable(profiles);
   const routerProfile = profiles.find((profile) => profile.role === "router");
   const definition = new WorkflowCompiler().compilePreset("adaptive");
   const repository = workflowRepository ?? new InMemoryWorkflowRepository();
   await repository.saveDefinition(definition);
-  const routerClient = createRouterClient(routerProfile, project);
+  const ownedRouterSessionIds = new Set<string>();
+  const routerClient = createRouterClient(routerProfile, project, (sessionId) => ownedRouterSessionIds.add(sessionId));
   // A router call may have to cold-start a provider CLI, which routinely outlasts the 15s library default.
   const engine = new WorkflowEngine(repository, new AgentStepExecutor(agentManager), new RouterManager(routerClient, ROUTER_TIMEOUT_MS));
   const title = task.slice(0, 80);
   let conversation: AppConversation = { id: randomUUID(), projectId: project.id, title,
     createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+  let workflowRunId: string | undefined;
   const unsubscribe = engine.events.subscribe((event) => {
     if (event.type === "workflow.started") {
       // Step sessions use the workflow run id as their conversation id, so the row has to exist under that id.
@@ -157,19 +183,26 @@ async function runChatWorkflow(project: Project, task: string): Promise<SessionS
       conversation = { id: event.workflowRunId, projectId: project.id, title, createdAt: now, updatedAt: now };
       persistence?.saveConversation(conversation);
       persistence?.saveMessage({ id: randomUUID(), conversationId: conversation.id, role: "user", content: task, createdAt: now });
-      activeChatRun = { id: event.workflowRunId, engine };
+      workflowRunId = event.workflowRunId;
+      activeChatRuns.set(event.workflowRunId, engine);
     }
-    for (const window of BrowserWindow.getAllWindows()) window.webContents.send(IPC_CHANNELS.workflowsEvent, event);
+    const runId = event.type === "workflow.started" ? event.workflowRunId : workflowRunId;
+    if (runId !== undefined) {
+      const desktopEvent = { ...event, workflowRunId: runId, projectId: project.id };
+      for (const window of BrowserWindow.getAllWindows()) window.webContents.send(IPC_CHANNELS.workflowsEvent, desktopEvent);
+    }
   });
   try {
     const result = await engine.run({ definition, profiles: Object.fromEntries(profiles.map((profile) => [profile.role, profile])) as GlobalRoleProfiles,
-      projectId: project.id, projectRoot: project.root, task });
+      projectId: project.id, projectRoot: project.root, task: workflowTask });
     if (result.run.summary !== undefined) persistence?.saveMessage({ id: randomUUID(), conversationId: conversation.id,
       role: "assistant", content: result.run.summary, createdAt: new Date().toISOString() });
     return { conversation, workflowRunId: result.run.id, workflowStatus: result.run.status };
   } finally {
-    unsubscribe(); activeChatRun = undefined; await routerClient.shutdown();
-    for (const sessionId of routerSessionIds) routerSessionIds.delete(sessionId);
+    unsubscribe();
+    if (workflowRunId !== undefined) activeChatRuns.delete(workflowRunId);
+    await routerClient.shutdown();
+    for (const sessionId of ownedRouterSessionIds) routerSessionIds.delete(sessionId);
   }
 }
 
@@ -241,6 +274,26 @@ function registerIpc(): void {
     projects.delete(projectId);
     return [...projects.values()];
   });
+  ipcMain.handle(IPC_CHANNELS.systemOpenLink, async (event, input: unknown) => {
+    assertTrustedIpc(event);
+    const { target, projectId } = openLinkInputSchema.parse(input);
+    let url: URL | undefined;
+    try { url = new URL(target); } catch { /* Relative project path. */ }
+    if (url !== undefined && ["http:", "https:", "mailto:"].includes(url.protocol)) {
+      await shell.openExternal(url.toString()); return;
+    }
+    if (url !== undefined && url.protocol !== "file:") throw new Error("Unsupported link type");
+    if (projectId === undefined) throw new Error("A project is required to open a local link");
+    const project = projects.get(projectId);
+    if (project === undefined) throw new Error("Unknown project");
+    const rawPath = url?.protocol === "file:" ? decodeURIComponent(url.pathname) : target.split(/[?#]/u, 1)[0]!;
+    const candidate = isAbsolute(rawPath) ? rawPath : resolve(project.root, rawPath);
+    const [workspaceRoot, targetPath] = await Promise.all([realpath(project.root), realpath(candidate)]);
+    const child = relative(workspaceRoot, targetPath);
+    if (child.startsWith("..") || isAbsolute(child)) throw new Error("Local links must stay inside the project");
+    const failure = await shell.openPath(targetPath);
+    if (failure.length > 0) throw new Error(failure);
+  });
   ipcMain.handle(IPC_CHANNELS.conversationsList, (event, input: unknown) => {
     assertTrustedIpc(event);
     const { projectId } = projectIdInputSchema.parse(input);
@@ -261,7 +314,7 @@ function registerIpc(): void {
     const { conversationId, projectId } = conversationRemoveInputSchema.parse(input);
     if (!projects.has(projectId)) throw new Error("Unknown project");
     if (persistence?.getConversation(conversationId)?.projectId !== projectId) throw new Error("Unknown conversation");
-    if (activeChatRun?.id === conversationId) throw new Error("Stop the running task before removing this conversation");
+    if (activeChatRuns.has(conversationId)) throw new Error("Stop the running task before removing this conversation");
     persistence?.removeConversation(conversationId);
     return persistence?.listConversations(projectId) ?? [];
   });
@@ -285,14 +338,38 @@ function registerIpc(): void {
     const { agentId } = agentModelsInputSchema.parse(input);
     return agentManager.registry.get(agentId).listModels();
   });
+  ipcMain.handle(IPC_CHANNELS.attachmentsChoose, async (event, input: unknown): Promise<AttachmentChoice[]> => {
+    assertTrustedIpc(event);
+    emptyInputSchema.parse(input);
+    const result = await dialog.showOpenDialog({ title: "Attach files to this task",
+      properties: ["openFile", "multiSelections"], filters: [
+        { name: "Images and files", extensions: ["png", "jpg", "jpeg", "gif", "webp", "heic", "svg", "pdf", "txt", "md", "json", "csv"] },
+        { name: "All files", extensions: ["*"] },
+      ] });
+    if (result.canceled) return [];
+    const choices = result.filePaths.slice(0, 10).map((path) => {
+      const id = randomUUID(); const mimeType = attachmentMimeType(path);
+      const choice: AttachmentChoice & { path: string } = { id, name: basename(path), mimeType,
+        kind: mimeType.startsWith("image/") ? "image" : "file", path };
+      selectedAttachments.set(id, choice);
+      return { id: choice.id, name: choice.name, mimeType: choice.mimeType, kind: choice.kind };
+    });
+    while (selectedAttachments.size > 100) {
+      const oldest = selectedAttachments.keys().next().value;
+      if (oldest === undefined) break; selectedAttachments.delete(oldest);
+    }
+    return choices;
+  });
   ipcMain.handle(IPC_CHANNELS.sessionsSend, async (event, input: unknown) => {
     assertTrustedIpc(event);
     const request = sessionSendInputSchema.parse(input);
     const project = projects.get(request.projectId);
     if (project === undefined) throw new Error("Choose a project before sending a task");
+    const attachments = takeAttachments(request.attachmentIds);
+    const effectiveText = taskWithAttachments(request.text, attachments);
     // Auto is the multi-agent path: the router picks the implementing role and decides after each stage whether the
     // work still needs a review or documentation. An explicit provider choice stays a single run below.
-    if (request.agentId === "auto" && process.env.WAING_E2E !== "1") return runChatWorkflow(project, request.text);
+    if (request.agentId === "auto" && process.env.WAING_E2E !== "1") return runChatWorkflow(project, request.text, effectiveText);
     const now = new Date().toISOString();
     const conversation = { id: randomUUID(), projectId: project.id, title: request.text.slice(0, 80), createdAt: now, updatedAt: now };
     persistence?.saveConversation(conversation);
@@ -312,9 +389,12 @@ function registerIpc(): void {
       payload: session, updatedAt: session.updatedAt });
     const model = request.model;
     const effort = request.effort;
-    await agentManager.send(session.id, { text: request.text, projectRoot: project.root, mode: request.mode,
+    const agentAttachments: NonNullable<AgentRequest["attachments"]> = attachments.map((item) =>
+      ({ name: item.name, mimeType: item.mimeType, path: item.path }));
+    await agentManager.send(session.id, { text: effectiveText, projectRoot: project.root, mode: request.mode,
       ...(model === undefined ? {} : { model }),
-      ...(effort === undefined ? {} : { effort }) });
+      ...(effort === undefined ? {} : { effort }),
+      ...(agentAttachments.length === 0 ? {} : { attachments: agentAttachments }) });
     // Nothing chose a model, so report the provider default the run fell back to instead of leaving the label blank.
     const resolvedModel = model ?? await defaultModelId(resolvedAgentId);
     return { conversation, session, resolvedAgentId,
@@ -326,7 +406,8 @@ function registerIpc(): void {
     assertTrustedIpc(event);
     const { sessionId } = sessionCancelInputSchema.parse(input);
     // Auto chat runs are workflows, so Stop cancels the engine when the renderer passes back a workflow run id.
-    if (activeChatRun?.id === sessionId) { await activeChatRun.engine.cancel(); return; }
+    const workflow = activeChatRuns.get(sessionId);
+    if (workflow !== undefined) { await workflow.cancel(); return; }
     await agentManager.cancel(sessionId);
   });
   ipcMain.handle(IPC_CHANNELS.permissionsRespond, (event, input: unknown) => {
@@ -350,6 +431,7 @@ function registerIpc(): void {
       const selector = new AutoSelector(new RouterManager(client, ROUTER_TIMEOUT_MS));
       const result = await selector.select({ type: "auto" }, { task: request.task }, {
         defaultRole: "medium", rules: [
+          { id: "planning", enabled: true, match: { taskType: "planning" }, targetRole: "planning", priority: 110 },
           { id: "documentation", enabled: true, match: { taskType: "documentation" }, targetRole: "document", priority: 100 },
           { id: "review", enabled: true, match: { taskType: "review" }, targetRole: "review", priority: 100 },
           { id: "bugfix", enabled: true, match: { taskType: "bugfix" }, targetRole: "bugfix", priority: 100 },
@@ -466,6 +548,8 @@ function createWindow(): BrowserWindow {
     minHeight: 600,
     show: false,
     title: "Waing",
+    ...(process.platform === "darwin" ? { titleBarStyle: "hiddenInset" as const,
+      trafficLightPosition: { x: 16, y: 18 } } : {}),
     webPreferences: {
       preload: new URL("../preload/index.cjs", import.meta.url).pathname,
       contextIsolation: true,

@@ -15,6 +15,7 @@ export function defaultIntent(node: WorkflowNode): StepAnnouncementIntent {
     ? node.operation === "create" ? "creating_prd" : "updating_prd" : "writing_docs" };
   if (node.type === "review_gate" || node.type === "role_task" && node.role === "review") return { activity: "reviewing" };
   if (node.type === "role_task" && node.role === "bugfix") return { activity: "fixing_bugs" };
+  if (node.type === "role_task" && node.role === "planning") return { activity: "planning" };
   return { activity: "implementing" };
 }
 

@@ -12,9 +12,9 @@ import { PersistenceStore } from "./PersistenceStore";
 import { SqliteDatabase } from "./SqliteDatabase";
 import { SqliteWorkflowRepository } from "./SqliteWorkflowRepository";
 
-const profiles = Object.fromEntries((["router", "low", "medium", "high", "review", "bugfix", "document"] as WorkflowRole[])
+const profiles = Object.fromEntries((["router", "planning", "low", "medium", "high", "review", "bugfix", "document"] as WorkflowRole[])
   .map((role) => [role, { role, enabled: true, agentId: role === "router" || role === "document" ? "opencode" : "codex",
-    effort: "low", mode: role === "review" ? "review" : "execute", permissionProfileId: "ask" } satisfies RoleExecutionProfile])) as GlobalRoleProfiles;
+    effort: "low", mode: role === "review" ? "review" : role === "planning" ? "plan" : "execute", permissionProfileId: "ask" } satisfies RoleExecutionProfile])) as GlobalRoleProfiles;
 
 class PersistedFakeExecutor implements WorkflowStepExecutor {
   calls = 0;
@@ -93,7 +93,7 @@ describe("SQLite persistence", () => {
       "provider_installations", "provider_health"].map((table) => [table,
       Number((database.connection.prepare(`SELECT COUNT(*) count FROM ${table}`).get() as { count: number }).count)]));
     expect(counts).toMatchObject({ provider_sessions: 1, agent_events: 1, permission_decisions: 1, routing_rules: 1,
-      workflow_role_profiles: 7, workflow_loop_state: 1, workflow_artifacts: 1, workflow_reviews: 1,
+      workflow_role_profiles: 8, workflow_loop_state: 1, workflow_artifacts: 1, workflow_reviews: 1,
       workflow_findings: 1, provider_installations: 1, provider_health: 1 });
     expect((database.connection.prepare("SELECT COUNT(*) count FROM schema_migrations").get() as { count: number }).count).toBe(1);
     database.close();

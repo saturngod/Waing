@@ -1,16 +1,35 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { AgentDescriptor, RoleExecutionProfile } from "@waing/domain";
 import { RoleProfileGrid } from "./RoleProfileGrid";
 import { PROVIDER_STATUS_HINT, providerDotState, providerStatusLabel } from "./providerStatus";
 
-export function SettingsPanel({ agents, eventCount, onRolesSaved }: {
-  agents: AgentDescriptor[]; eventCount: number; onRolesSaved: (needsReview: boolean) => void;
+type SettingsSection = "general" | "routing" | "providers" | "permissions" | "diagnostics";
+
+const SETTINGS_SECTIONS: Array<{ id: SettingsSection; label: string; icon: string; keywords: string }> = [
+  { id: "general", label: "General", icon: "⚙", keywords: "theme appearance updates" },
+  { id: "routing", label: "Roles & routing", icon: "⌘", keywords: "agents models effort mode workflow auto" },
+  { id: "providers", label: "Providers", icon: "◉", keywords: "codex claude opencode antigravity status health" },
+  { id: "permissions", label: "Permissions", icon: "◇", keywords: "access approvals remembered safety" },
+  { id: "diagnostics", label: "Diagnostics", icon: "◌", keywords: "events logs protocol export" },
+];
+
+export function SettingsPanel({ agents, eventCount, theme, onThemeChange, onRolesSaved, onBack }: {
+  agents: AgentDescriptor[]; eventCount: number; theme: "system" | "dark" | "light";
+  onThemeChange: (theme: "system" | "dark" | "light") => void;
+  onRolesSaved: (needsReview: boolean) => void; onBack: () => void;
 }) {
+  const [section, setSection] = useState<SettingsSection>("general");
+  const [search, setSearch] = useState("");
   const [exportedPath, setExportedPath] = useState<string>();
   const [profiles, setProfiles] = useState<RoleExecutionProfile[]>([]);
   const [dirty, setDirty] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string>();
+  const visibleSections = useMemo(() => {
+    const query = search.trim().toLocaleLowerCase();
+    return query.length === 0 ? SETTINGS_SECTIONS : SETTINGS_SECTIONS.filter((item) =>
+      `${item.label} ${item.keywords}`.toLocaleLowerCase().includes(query));
+  }, [search]);
 
   useEffect(() => {
     void window.waing.settings.roles().then((view) => setProfiles(view.profiles))
@@ -31,35 +50,60 @@ export function SettingsPanel({ agents, eventCount, onRolesSaved }: {
   async function exportDiagnostics(): Promise<void> {
     const path = await window.waing.diagnostics.export(); if (path !== null) setExportedPath(path);
   }
+  function navigate(next: SettingsSection): void { setSection(next); setSearch(""); }
 
-  // The page title lives in the workspace topbar, so the panel starts straight at its first card.
   return <section className="settings-panel" aria-label="Settings">
-    <article className="roles-settings" aria-label="Role routing">
-      <div className="roles-heading">
-        <div><h3>Roles & routing</h3>
-          <p>Auto routing classifies each task, then runs it with the provider you assign to that role here.</p></div>
-        <div className="roles-actions">
-          {saved && !dirty && <span>Saved</span>}
-          <button className="primary" type="button" disabled={!dirty || profiles.length === 0} onClick={() => void save()}>
-            {dirty ? "Save routing" : "Saved"}
-          </button>
-        </div>
-      </div>
-      {profiles.length === 0 ? <p>Loading roles…</p> : <RoleProfileGrid profiles={profiles} agents={agents} onChange={update} />}
-      {error !== undefined && <p className="error" role="alert">{error}</p>}
-    </article>
-    <div className="settings-grid">
-      <article><h3>General</h3><label>Theme<select defaultValue="system"><option>system</option><option>dark</option><option>light</option></select></label>
-        <label>Updates<select defaultValue="manual"><option>manual</option><option>notify</option></select></label></article>
-      <article className="provider-settings"><h3 title={PROVIDER_STATUS_HINT}>Provider status</h3>{agents.map((agent) => <div key={agent.id}>
-        <span className={`provider-dot ${providerDotState(agent)}`}/><strong>{agent.displayName}</strong>
-        <small>{providerStatusLabel(agent)}</small>
-        {agent.warnings.map((warning) => <em key={warning}>{warning}</em>)}
-      </div>)}</article>
-      <article><h3>Permissions</h3><p>Default: Ask before changes</p><button type="button">Clear remembered permissions</button></article>
-      <article><h3>Diagnostics</h3><p>Normalized events this session: {eventCount}</p><p>Protocol trace: Off</p>
-        <button type="button" onClick={() => void exportDiagnostics()}>Export redacted diagnostics</button>
-        {exportedPath !== undefined && <p>Saved to {exportedPath}</p>}</article>
+    <aside className="settings-sidebar">
+      <button className="settings-back" type="button" onClick={onBack}><span>←</span> Back to app</button>
+      <label className="settings-search"><span aria-hidden="true">⌕</span><input type="search" aria-label="Search settings"
+        placeholder="Search settings…" value={search} onChange={(event) => setSearch(event.target.value)} /></label>
+      <p className="settings-group-label">Waing</p>
+      <nav aria-label="Settings categories">{visibleSections.map((item) => <button type="button" key={item.id}
+        className={section === item.id && search.length === 0 ? "active" : ""} onClick={() => navigate(item.id)}>
+        <span aria-hidden="true">{item.icon}</span>{item.label}</button>)}</nav>
+      {visibleSections.length === 0 && <p className="settings-no-results">No settings found</p>}
+    </aside>
+    <div className="settings-page">
+      {section === "general" && <><header><p>Settings</p><h2>General</h2></header>
+        <div className="settings-section"><h3>Appearance</h3><div className="settings-card settings-rows">
+          <label><span><strong>Theme</strong><small>Choose how Waing looks on this device.</small></span>
+            <select aria-label="Theme" value={theme} onChange={(event) =>
+              onThemeChange(event.target.value as "system" | "dark" | "light")}>
+              <option>system</option><option>dark</option><option>light</option></select></label>
+          <label><span><strong>Updates</strong><small>Control how application updates are announced.</small></span>
+            <select defaultValue="manual"><option>manual</option><option>notify</option></select></label>
+        </div></div></>}
+
+      {section === "routing" && <><header><p>Settings</p><h2>Roles & routing</h2>
+        <span>Choose which provider and model handles each kind of work.</span></header>
+        <div className="settings-section routing-settings"><div className="settings-section-heading"><h3>Role assignments</h3>
+          <div>{saved && !dirty && <span>Saved</span>}<button className="primary" type="button"
+            disabled={!dirty || profiles.length === 0} onClick={() => void save()}>{dirty ? "Save routing" : "Saved"}</button></div></div>
+          {profiles.length === 0 ? <p>Loading roles…</p> : <RoleProfileGrid profiles={profiles} agents={agents} onChange={update} />}
+          {error !== undefined && <p className="error" role="alert">{error}</p>}
+        </div></>}
+
+      {section === "providers" && <><header><p>Settings</p><h2>Providers</h2><span>Installed coding agents and their current availability.</span></header>
+        <div className="settings-section"><h3 title={PROVIDER_STATUS_HINT}>Provider status</h3><div className="settings-card provider-settings">
+          {agents.map((agent) => <div key={agent.id}><span className={`provider-dot ${providerDotState(agent)}`}/>
+            <strong>{agent.displayName}</strong><small>{providerStatusLabel(agent)}</small>
+            {agent.warnings.map((warning) => <em key={warning}>{warning}</em>)}</div>)}</div></div></>}
+
+      {section === "permissions" && <><header><p>Settings</p><h2>Permissions</h2><span>Control how agents request access to your projects.</span></header>
+        <div className="settings-section"><h3>Remembered access</h3><div className="settings-card settings-rows">
+          <div><span><strong>Default permissions</strong><small>Agents ask before changing files or running commands.</small></span>
+            <b>Ask before changes</b></div>
+          <div><span><strong>Remembered decisions</strong><small>Remove project approvals saved from earlier tasks.</small></span>
+            <button type="button">Clear remembered permissions</button></div>
+        </div></div></>}
+
+      {section === "diagnostics" && <><header><p>Settings</p><h2>Diagnostics</h2><span>Inspect and export provider-neutral troubleshooting data.</span></header>
+        <div className="settings-section"><h3>Session diagnostics</h3><div className="settings-card settings-rows">
+          <div><span><strong>Normalized events</strong><small>Events received during this app session.</small></span><b>{eventCount}</b></div>
+          <div><span><strong>Protocol trace</strong><small>Sensitive provider traffic is not being recorded.</small></span><b>Off</b></div>
+          <div><span><strong>Redacted export</strong><small>Create a diagnostics file with known secrets removed.</small></span>
+            <button type="button" onClick={() => void exportDiagnostics()}>Export diagnostics</button></div>
+        </div>{exportedPath !== undefined && <p className="settings-exported">Saved to {exportedPath}</p>}</div></>}
     </div>
   </section>;
 }

@@ -4,14 +4,15 @@ import remarkGfm from "remark-gfm";
 /**
  * Renders agent output as Markdown. `react-markdown` builds React elements instead of HTML strings, and no
  * `rehype-raw` plugin is enabled, so raw HTML inside a model's answer stays inert text — the renderer never gets
- * near `dangerouslySetInnerHTML`. Only http(s) links become anchors; the main process opens those externally and
- * blocks in-window navigation, and every other scheme (`javascript:`, `file:`, …) is shown as plain text.
+ * near `dangerouslySetInnerHTML`. Safe web links and project-scoped local paths are handed to a narrow preload API;
+ * the main process opens them with the system default app and blocks in-window navigation.
  */
-export function Markdown({ text }: { text: string }) {
+export function Markdown({ text, projectId }: { text: string; projectId?: string }) {
   return <div className="markdown">
     <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
-      a: ({ href, children }) => isSafeLink(href)
-        ? <a href={href} target="_blank" rel="noreferrer noopener">{children}</a>
+      a: ({ href, children }) => isSafeLink(href, projectId)
+        ? <a href={href} onClick={(event) => { event.preventDefault();
+          void window.waing.system.openLink(href, projectId).catch(() => undefined); }}>{children}</a>
         : <span className="md-inert-link">{children}</span>,
       // Tables can be far wider than the column; each one scrolls inside its own box instead of the page.
       table: ({ children }) => <div className="md-table-scroll"><table>{children}</table></div>,
@@ -20,7 +21,8 @@ export function Markdown({ text }: { text: string }) {
   </div>;
 }
 
-function isSafeLink(href: string | undefined): href is string {
+function isSafeLink(href: string | undefined, projectId: string | undefined): href is string {
   if (href === undefined) return false;
-  try { return ["http:", "https:"].includes(new URL(href).protocol); } catch { return false; }
+  try { return ["http:", "https:", "mailto:"].includes(new URL(href).protocol) || new URL(href).protocol === "file:" && projectId !== undefined; }
+  catch { return projectId !== undefined && !href.startsWith("#"); }
 }

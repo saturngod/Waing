@@ -22,7 +22,7 @@ export interface WorkflowStartInput { definition: WorkflowDefinition; profiles: 
   projectRoot: string; task: string }
 
 const actionRoles: Partial<Record<WorkflowNextActionKind, Exclude<WorkflowRole, "router">>> = {
-  execute_low: "low", execute_medium: "medium", execute_high: "high", create_prd: "document", update_prd: "document",
+  plan: "planning", execute_low: "low", execute_medium: "medium", execute_high: "high", create_prd: "document", update_prd: "document",
   write_documentation: "document", review: "review", fix: "bugfix",
 };
 

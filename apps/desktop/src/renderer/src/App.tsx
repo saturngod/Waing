@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { AppInfo, SessionSendResult } from "@waing/ipc-contracts";
+import type { AppInfo, AttachmentChoice, SessionSendResult } from "@waing/ipc-contracts";
 import type { AgentDescriptor, AgentEvent, AppConversation, AutoSelection, PermissionRequest, Project, StepAnnouncement } from "@waing/domain";
 import { ActivityTimeline } from "./ActivityTimeline";
 import type { TimelineStep } from "./ActivityTimeline";
@@ -8,6 +8,15 @@ import { SettingsPanel } from "./SettingsPanel";
 import { PROVIDER_DOT_TITLES, providerDotState } from "./providerStatus";
 
 type View = "chat" | "settings";
+type ThemePreference = "system" | "dark" | "light";
+
+const THEME_STORAGE_KEY = "waing.theme";
+function savedTheme(): ThemePreference {
+  try {
+    const value = window.localStorage.getItem(THEME_STORAGE_KEY);
+    return value === "dark" || value === "light" || value === "system" ? value : "system";
+  } catch { return "system"; }
+}
 
 const tokenFormat = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 });
 const compactTokens = (value: number): string => tokenFormat.format(value);
@@ -24,16 +33,20 @@ export function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [project, setProject] = useState<Project | null>(null);
   const [conversations, setConversations] = useState<AppConversation[]>([]);
+  const [conversationsByProject, setConversationsByProject] = useState<Record<string, AppConversation[]>>({});
+  const [runningProjectIds, setRunningProjectIds] = useState<Set<string>>(() => new Set());
+  const [activeRunByProject, setActiveRunByProject] = useState<Record<string, string>>({});
+  const [permissionsByProject, setPermissionsByProject] = useState<Record<string, PermissionRequest>>({});
   const [error, setError] = useState<string>();
   const [permission, setPermission] = useState<PermissionRequest>();
   const [lastEvent, setLastEvent] = useState<AgentEvent["type"]>();
   const [events, setEvents] = useState<AgentEvent[]>([]);
   const [agents, setAgents] = useState<AgentDescriptor[]>([]);
   const [task, setTask] = useState("");
+  const [attachments, setAttachments] = useState<AttachmentChoice[]>([]);
   const [prompt, setPrompt] = useState<string>();
   const [routing, setRouting] = useState<AutoSelection>();
   const [routingBusy, setRoutingBusy] = useState(false);
-  const [sendBusy, setSendBusy] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState<string>();
   const [resolvedAgentId, setResolvedAgentId] = useState<string>();
   const [resolvedModel, setResolvedModel] = useState<string>();
@@ -47,24 +60,82 @@ export function App() {
   const [replayText, setReplayText] = useState<string>();
   const [menuFor, setMenuFor] = useState<{ id: string; x: number; y: number }>();
   const [view, setView] = useState<View>("chat");
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [theme, setTheme] = useState<ThemePreference>(savedTheme);
   const [confirmingRemoval, setConfirmingRemoval] = useState(false);
   const [routingNeedsReview, setRoutingNeedsReview] = useState(false);
+  const selectedProjectIdRef = useRef<string | undefined>(undefined);
+  const workflowProjectRef = useRef(new Map<string, string>());
+  const pendingTaskTitleRef = useRef(new Map<string, string>());
+  const sendBusy = project !== null && runningProjectIds.has(project.id);
+
+  useEffect(() => {
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const apply = (): void => {
+      const resolved = theme === "system" ? media.matches ? "dark" : "light" : theme;
+      document.documentElement.dataset.theme = resolved;
+      document.documentElement.style.colorScheme = resolved;
+    };
+    apply();
+    if (theme === "system") media.addEventListener("change", apply);
+    try { window.localStorage.setItem(THEME_STORAGE_KEY, theme); } catch { /* preference stays session-local */ }
+    return () => media.removeEventListener("change", apply);
+  }, [theme]);
 
   useEffect(() => {
     void window.waing.app.info().then(setInfo).catch(reportError);
     void window.waing.agents.list().then(setAgents).catch(reportError);
-    void window.waing.projects.list().then((existing) => { setProjects(existing); setProject(existing[0] ?? null); }).catch(reportError);
+    void window.waing.projects.list().then(async (existing) => {
+      setProjects(existing); setProject(existing[0] ?? null);
+      const entries = await Promise.all(existing.map(async (item) => [item.id, await window.waing.conversations.list(item.id)] as const));
+      setConversationsByProject(Object.fromEntries(entries));
+      setConversations(entries[0]?.[1] ?? []);
+    }).catch(reportError);
     void window.waing.settings.roles().then((view) => setRoutingNeedsReview(view.needsReview)).catch(reportError);
     const unsubscribeSession = window.waing.sessions.onEvent((event) => {
+      if (event.workflowRunId !== undefined) {
+        const eventProjectId = workflowProjectRef.current.get(event.workflowRunId);
+        if (eventProjectId !== undefined) {
+          if (event.type === "permission.requested") {
+            setPermissionsByProject((current) => ({ ...current, [eventProjectId]: event.request }));
+          } else if (event.type === "permission.resolved") {
+            setPermissionsByProject((current) => { const next = { ...current }; delete next[eventProjectId]; return next; });
+          }
+          if (eventProjectId !== selectedProjectIdRef.current) return;
+        }
+      }
       setLastEvent(event.type);
       setEvents((current) => [...current, event]);
       if (event.type === "permission.requested") setPermission(event.request);
       if (event.type === "permission.resolved") setPermission(undefined);
       // A workflow keeps running past a single step's terminal event, so only its own events clear the busy state.
-      if ((event.type === "run.completed" || event.type === "run.failed") && event.workflowRunId === undefined) setSendBusy(false);
     });
     const unsubscribeWorkflow = window.waing.workflows.onEvent((event) => {
-      if (event.type === "workflow.started") { setActiveSessionId(event.workflowRunId); setRouterStep("idle"); }
+      workflowProjectRef.current.set(event.workflowRunId, event.projectId);
+      if (event.type === "workflow.started") {
+        setRunningProjectIds((current) => new Set(current).add(event.projectId));
+        setActiveRunByProject((current) => ({ ...current, [event.projectId]: event.workflowRunId }));
+        const now = new Date().toISOString();
+        const runningConversation: AppConversation = { id: event.workflowRunId, projectId: event.projectId,
+          title: pendingTaskTitleRef.current.get(event.projectId) ?? "Running task", createdAt: now, updatedAt: now };
+        setConversationsByProject((current) => ({ ...current, [event.projectId]: [runningConversation,
+          ...(current[event.projectId] ?? []).filter((item) => item.id !== event.workflowRunId)] }));
+        if (event.projectId === selectedProjectIdRef.current) {
+          setConversations((current) => [runningConversation, ...current.filter((item) => item.id !== event.workflowRunId)]);
+          setActiveSessionId(event.workflowRunId); setOpenConversationId(event.workflowRunId); setRouterStep("idle");
+        }
+      }
+      const selected = event.projectId === selectedProjectIdRef.current;
+      if (!selected) {
+        if (event.type === "workflow.completed" || event.type === "workflow.failed" || event.type === "workflow.cancelled"
+          || event.type === "workflow.paused") {
+          setRunningProjectIds((current) => { const next = new Set(current); next.delete(event.projectId); return next; });
+          setActiveRunByProject((current) => { const next = { ...current }; delete next[event.projectId]; return next; });
+          void window.waing.conversations.list(event.projectId).then((items) =>
+            setConversationsByProject((current) => ({ ...current, [event.projectId]: items }))).catch(reportError);
+        }
+        return;
+      }
       if (event.type === "workflow.router.started") {
         setWorkflowSteps((current) => [...current, { id: `router-${String(current.length)}`, title: "Routing",
           detail: "Deciding the next step…", state: "pending" }]);
@@ -100,18 +171,27 @@ export function App() {
         setWorkflowSteps((current) => [...current, { id: `failed-${String(current.length)}`, title: "Workflow failed", detail: event.message, state: "failed" }]);
       }
       if (event.type === "workflow.completed" || event.type === "workflow.failed" || event.type === "workflow.cancelled"
-        || event.type === "workflow.paused") { setSendBusy(false); setActiveStep(undefined); }
+        || event.type === "workflow.paused") {
+        setRunningProjectIds((current) => { const next = new Set(current); next.delete(event.projectId); return next; });
+        setActiveRunByProject((current) => { const next = { ...current }; delete next[event.projectId]; return next; });
+        setActiveStep(undefined);
+      }
     });
     return () => { unsubscribeSession(); unsubscribeWorkflow(); };
   }, []);
 
   useEffect(() => {
+    selectedProjectIdRef.current = project?.id;
     setConfirmingRemoval(false);
     if (project === null) { setConversations([]); return; }
-    void window.waing.conversations.list(project.id).then(setConversations).catch(reportError);
+    void window.waing.conversations.list(project.id).then((items) => {
+      setConversations(items);
+      setConversationsByProject((current) => ({ ...current, [project.id]: items }));
+    }).catch(reportError);
   }, [project]);
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   const followRef = useRef(true);
 
   // Streaming appends to the bottom of the transcript, so follow it unless the user scrolled away.
@@ -151,21 +231,53 @@ export function App() {
     setError(reason instanceof Error ? reason.message : "An unexpected error occurred");
   }
 
-  async function chooseProject(): Promise<void> {
+  function selectProject(nextProject: Project): void {
+    if (nextProject.id === project?.id) return;
+    clearTranscript(); setReplayText(undefined); setTask(""); setAttachments([]);
+    setConversations(conversationsByProject[nextProject.id] ?? []);
+    setActiveSessionId(activeRunByProject[nextProject.id]);
+    setOpenConversationId(activeRunByProject[nextProject.id]);
+    setPermission(permissionsByProject[nextProject.id]);
+    setProject(nextProject);
+  }
+
+  async function chooseProject(): Promise<Project | null> {
     setError(undefined);
     try {
       const selected = await window.waing.projects.choose();
       if (selected !== null) {
-        setProject(selected);
+        selectProject(selected);
         setProjects((current) => current.some((item) => item.id === selected.id) ? current : [selected, ...current]);
+        const items = await window.waing.conversations.list(selected.id);
+        setConversations(items);
+        setConversationsByProject((current) => ({ ...current, [selected.id]: items }));
       }
+      return selected;
     } catch (reason) {
       reportError(reason);
+      return null;
     }
   }
 
+  async function beginNewTask(): Promise<void> {
+    if (sendBusy) return;
+    const target = project ?? await chooseProject();
+    if (target === null) return;
+    clearTranscript(); setReplayText(undefined); setTask(""); setAttachments([]); setError(undefined);
+    window.requestAnimationFrame(() => composerRef.current?.focus());
+  }
+
+  async function chooseAttachments(): Promise<void> {
+    setError(undefined);
+    try {
+      const choices = await window.waing.attachments.choose();
+      setAttachments((current) => [...current, ...choices].slice(0, 10));
+      window.requestAnimationFrame(() => composerRef.current?.focus());
+    } catch (reason) { reportError(reason); }
+  }
+
   function closeProject(): void {
-    setProject(null); setConfirmingRemoval(false); setEvents([]); setPrompt(undefined);
+    setProject(null); setConfirmingRemoval(false); setEvents([]); setPrompt(undefined); setAttachments([]);
     setRouting(undefined); setPermission(undefined); setActiveSessionId(undefined); setResolvedAgentId(undefined);
   }
 
@@ -175,6 +287,7 @@ export function App() {
     try {
       const remaining = await window.waing.projects.remove(project.id);
       setProjects(remaining);
+      setConversationsByProject((current) => { const next = { ...current }; delete next[project.id]; return next; });
       setConfirmingRemoval(false);
       setProject(remaining[0] ?? null);
       setEvents([]); setRouting(undefined); setPermission(undefined); setPrompt(undefined);
@@ -217,7 +330,9 @@ export function App() {
     if (project === null) return;
     setError(undefined); setMenuFor(undefined);
     try {
-      setConversations(await window.waing.conversations.remove(conversationId, project.id));
+      const items = await window.waing.conversations.remove(conversationId, project.id);
+      setConversations(items);
+      setConversationsByProject((current) => ({ ...current, [project.id]: items }));
       if (openConversationId === conversationId) { clearTranscript(); setReplayText(undefined); }
     } catch (reason) { reportError(reason); }
   }
@@ -231,26 +346,37 @@ export function App() {
   }
 
   async function sendTask(): Promise<void> {
-    if (project === null || task.trim().length === 0) return;
-    const text = task.trim();
-    setError(undefined); setRouting(undefined); setEvents([]); setPermission(undefined); setSendBusy(true);
-    setPrompt(text); setTask(""); setRoutedBy(undefined); setResolvedAgentId(undefined);
+    if (project === null || (task.trim().length === 0 && attachments.length === 0)) return;
+    const text = task.trim().length === 0 ? "Please review the attached files." : task.trim();
+    const selectedAttachments = attachments;
+    setError(undefined); setRouting(undefined); setEvents([]); setPermission(undefined);
+    setRunningProjectIds((current) => new Set(current).add(project.id));
+    pendingTaskTitleRef.current.set(project.id, text.slice(0, 80));
+    setPrompt(text); setTask(""); setAttachments([]); setRoutedBy(undefined); setResolvedAgentId(undefined);
     setResolvedModel(undefined); setResolvedEffort(undefined);
     setWorkflowSteps([]); setAgentMeta({}); setActiveStep(undefined); setActiveSessionId(undefined);
     // Routing happens inside the send call, so the step is shown as running until the reply names the routed role.
     setRouterStep("running");
     try {
       // Always Auto: the router picks the role, and that role's saved profile supplies provider, model, and effort.
-      const result = await window.waing.sessions.send({ projectId: project.id, text, agentId: "auto", mode: "execute" });
+      const result = await window.waing.sessions.send({ projectId: project.id, text, agentId: "auto", mode: "execute",
+        ...(selectedAttachments.length === 0 ? {} : { attachmentIds: selectedAttachments.map((item) => item.id) }) });
       if (result.session !== undefined) setActiveSessionId(result.session.id);
       setResolvedAgentId(result.resolvedAgentId);
       setResolvedModel(result.resolvedModel); setResolvedEffort(result.resolvedEffort);
       setRoutedBy(result.routing); setRouterStep("idle");
       // A workflow reports its own terminal event; a single agent run is already finished when send resolves.
-      if (result.workflowRunId !== undefined) setSendBusy(false);
+      if (result.workflowRunId === undefined) {
+        setRunningProjectIds((current) => { const next = new Set(current); next.delete(project.id); return next; });
+      }
+      pendingTaskTitleRef.current.delete(project.id);
       setConversations((current) => [result.conversation, ...current.filter((item) => item.id !== result.conversation.id)]);
+      setConversationsByProject((current) => ({ ...current,
+        [project.id]: [result.conversation, ...(current[project.id] ?? []).filter((item) => item.id !== result.conversation.id)] }));
     } catch (reason) {
-      setSendBusy(false); setPrompt(undefined); setTask(text);
+      setRunningProjectIds((current) => { const next = new Set(current); next.delete(project.id); return next; });
+      pendingTaskTitleRef.current.delete(project.id);
+      setPrompt(undefined); setTask(text); setAttachments(selectedAttachments);
       setRouterStep((current) => current === "running" ? "failed" : "idle");
       reportError(reason);
     }
@@ -263,25 +389,41 @@ export function App() {
   }
 
   return (
-    <main className={`app-shell ${view === "settings" ? "settings" : ""}`}>
-      <aside className="rail">
-        <div className="brand">W</div>
-        <nav aria-label="Primary navigation">
-          <button className={`nav-item ${view === "chat" ? "active" : ""}`} aria-label="Workspace" onClick={() => setView("chat")}>⌂</button>
-          <button className={`nav-item ${view === "settings" ? "active" : ""}`} aria-label="Settings" onClick={() => setView("settings")}>⚙</button>
-        </nav>
-      </aside>
+    <main className={`app-shell platform-${info?.platform ?? "unknown"} ${view === "settings" ? "settings" : sidebarOpen ? "" : "sidebar-collapsed"}`}>
       {/* Settings are global, so the project and conversation rail is hidden there rather than implying a scope. */}
-      {view === "chat" && <aside className="context-sidebar">
-        <div className="app-title"><h1>Waing</h1><span data-testid="version">{info === undefined ? "…" : `v${info.version}`}</span></div>
-        <button className="project-picker" type="button" onClick={() => void chooseProject()}>
-          <span className="project-glyph">{project?.name.slice(0, 1).toUpperCase() ?? "+"}</span>
-          <span><strong>{project?.name ?? "Open project"}</strong><small>{project?.root ?? "Choose a local repository"}</small></span><b>⌄</b>
-        </button>
-        {projects.length > 1 && <select className="project-select" aria-label="Current project" value={project?.id ?? ""}
-          onChange={(event) => setProject(projects.find((item) => item.id === event.target.value) ?? null)}>
-          {projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
-        </select>}
+      {view === "chat" && sidebarOpen && <aside className="context-sidebar">
+        <div className="sidebar-chrome"><span className="traffic-light-space" aria-hidden="true" />
+          <button className="sidebar-toggle" type="button" aria-label="Hide sidebar" title="Hide sidebar"
+            onClick={() => setSidebarOpen(false)}><span className="sidebar-toggle-icon" aria-hidden="true" /></button></div>
+        <div className="app-title"><h1>Waing</h1><button type="button" aria-label="Open project" title="Open project"
+          onClick={() => void chooseProject()}>＋</button><span data-testid="version">{info === undefined ? "…" : `v${info.version}`}</span></div>
+        <button className="new-task-button" type="button" disabled={sendBusy}
+          title={sendBusy ? "Stop the running task first" : project === null ? "Choose a project and start a task" : "Start a new task"}
+          onClick={() => void beginNewTask()}><span aria-hidden="true">◇</span> New task</button>
+        <div className="sidebar-heading"><span>Projects</span></div>
+        <div className="project-tree">{projects.length === 0 ?
+          <button className="empty-project" type="button" onClick={() => void chooseProject()}>Open your first project</button> :
+          projects.map((item) => {
+            const active = item.id === project?.id;
+            const running = runningProjectIds.has(item.id);
+            const items = active ? conversations : conversationsByProject[item.id] ?? [];
+            return <section className={`project-group ${active ? "active" : ""}`} key={item.id}>
+              <button className="project-row" type="button" aria-expanded={active} title={item.root} onClick={() => selectProject(item)}>
+                <span className="folder-icon" aria-hidden="true" />
+                <strong>{item.name}</strong>
+                {running && <span className={`task-running ${permissionsByProject[item.id] === undefined ? "" : "attention"}`}
+                  title={permissionsByProject[item.id] === undefined ? "Task running" : "Permission needed"} />}
+                <span className="project-chevron">{active ? "⌄" : "›"}</span>
+              </button>
+              {active && <div className="conversation-list">{items.length === 0 ? <p>No tasks yet</p> : items.map((conversation) =>
+                <button type="button" key={conversation.id} className={openConversationId === conversation.id ? "active" : ""}
+                  disabled={sendBusy} title={sendBusy ? "Stop the running task first" : conversation.title}
+                  onClick={() => void openConversation(conversation.id)}
+                  onContextMenu={(event) => { event.preventDefault(); setMenuFor({ id: conversation.id, x: event.clientX, y: event.clientY }); }}>
+                  <span>{conversation.title}</span>{conversation.id === activeSessionId && <i className="task-running" title="Running" />}
+                </button>)}</div>}
+            </section>;
+          })}</div>
         {project !== null && <div className="project-actions">
           {confirmingRemoval ? <>
             <span>Remove {project.name} and its local history?</span>
@@ -293,26 +435,23 @@ export function App() {
               onClick={() => setConfirmingRemoval(true)}>Remove…</button>
           </>}
         </div>}
-        <div className="sidebar-heading"><span>Conversations</span><button type="button" aria-label="New conversation"
-          onClick={() => { clearTranscript(); setReplayText(undefined); setTask(""); }}>＋</button></div>
-        <div className="conversation-list">{conversations.length === 0 ? <p>No conversations yet</p> : conversations.map((conversation) =>
-          <button type="button" key={conversation.id} className={openConversationId === conversation.id ? "active" : ""}
-            disabled={sendBusy} title={sendBusy ? "Stop the running task first" : conversation.title}
-            onClick={() => void openConversation(conversation.id)}
-            onContextMenu={(event) => { event.preventDefault(); setMenuFor({ id: conversation.id, x: event.clientX, y: event.clientY }); }}>
-            <span>{conversation.title}</span><small>{new Date(conversation.updatedAt).toLocaleDateString()}</small></button>)}</div>
         {menuFor !== undefined && <>
           <div className="menu-backdrop" onClick={() => setMenuFor(undefined)} onContextMenu={(event) => { event.preventDefault(); setMenuFor(undefined); }} />
           <div className="context-menu" style={{ left: menuFor.x, top: menuFor.y }} role="menu" aria-label="Conversation actions">
             <button type="button" role="menuitem" className="danger" onClick={() => void removeConversation(menuFor.id)}>Delete conversation</button>
           </div>
         </>}
-        <div className="sidebar-version">{info === undefined ? "Starting…" : `${info.name} · ${info.platform}`}</div>
+        <div className="sidebar-footer"><button type="button" aria-label="Settings" onClick={() => setView("settings")}>
+          <span aria-hidden="true">⚙</span> Settings</button>
+          <small>{info === undefined ? "Starting…" : `${info.name} · ${info.platform}`}</small></div>
       </aside>}
       <section className="workspace">
         <header className="topbar">
           {view === "chat"
-            ? <div><p className="eyebrow">Agent workspace</p><h2>{project?.name ?? "No project selected"}</h2></div>
+            ? <div className="topbar-leading">{!sidebarOpen && <button className="sidebar-toggle reveal" type="button"
+                aria-label="Show sidebar" title="Show sidebar" onClick={() => setSidebarOpen(true)}>
+                <span className="sidebar-toggle-icon" aria-hidden="true" /></button>}
+              <div><p className="eyebrow">Agent workspace</p><h2>{project?.name ?? "No project selected"}</h2></div></div>
             : <div><p className="eyebrow">Applies to every project</p><h2>Settings</h2></div>}
           {/* No per-send agent/model/mode pickers: routing always decides, and Settings owns each role's provider. */}
           {/* A run keeps going while Settings is open, so its state and Stop stay reachable from here. */}
@@ -340,8 +479,10 @@ export function App() {
           followRef.current = node.scrollHeight - node.scrollTop - node.clientHeight < 80;
         }}>
           {view === "settings" ? <SettingsPanel agents={agents} eventCount={events.length}
-            onRolesSaved={(needsReview) => setRoutingNeedsReview(needsReview)} /> :
-            <><ActivityTimeline events={events} steps={steps} agentMeta={agentMeta} {...(prompt === undefined ? {} : { prompt })}
+            theme={theme} onThemeChange={setTheme}
+            onRolesSaved={(needsReview) => setRoutingNeedsReview(needsReview)} onBack={() => setView("chat")} /> :
+            <><ActivityTimeline events={events} steps={steps} agentMeta={agentMeta}
+              {...(project === null ? {} : { projectId: project.id })} {...(prompt === undefined ? {} : { prompt })}
               {...(replayText === undefined || replayText.length === 0 ? {} : { replayText })}
               {...(modelLabel === undefined ? {} : { model: modelLabel })} {...(effortLabel === undefined ? {} : { effort: effortLabel })} />
               {routing !== undefined && <RoutingDecisionCard selection={routing} />}
@@ -359,13 +500,19 @@ export function App() {
           {lastEvent !== undefined && <output data-testid="last-event">{lastEvent}</output>}
         </div>
         {view === "chat" && <div className="composer-wrap">
-          <div className="composer"><textarea aria-label="Message" value={task} onChange={(event) => setTask(event.target.value)}
+          <div className="composer">{attachments.length > 0 && <ul className="composer-attachments" aria-label="Attached files">
+            {attachments.map((attachment) => <li key={attachment.id}><span aria-hidden="true">{attachment.kind === "image" ? "▧" : "▤"}</span>
+              <span title={attachment.name}>{attachment.name}</span><button type="button" aria-label={`Remove ${attachment.name}`}
+                onClick={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))}>×</button></li>)}</ul>}
+            <textarea ref={composerRef} aria-label="Message" value={task} onChange={(event) => setTask(event.target.value)}
             placeholder="Ask an agent to inspect, explain, or change this project…" rows={3}
             onKeyDown={(event) => { if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) void sendTask(); }} />
-            <div><span>{project?.root ?? "Choose a project to begin"}</span><div className="composer-actions">
+            <div><div className="composer-context"><button className="attach-button" type="button" aria-label="Attach files and images"
+              title="Attach files and images" onClick={() => void chooseAttachments()}>＋</button>
+              <span>{project?.root ?? "Choose a project to begin"}</span></div><div className="composer-actions">
               <button type="button" disabled={routingBusy || project === null || task.trim().length === 0} onClick={() => void previewRoute()}>{routingBusy ? "Routing…" : "Preview route"}</button>
               {sendBusy ? <button className="stop" type="button" onClick={() => void cancelRun()}>Stop</button> :
-                <button className="send" type="button" disabled={project === null || task.trim().length === 0} onClick={() => void sendTask()}>Send ↵</button>}
+                <button className="send" type="button" disabled={project === null || (task.trim().length === 0 && attachments.length === 0)} onClick={() => void sendTask()}>Send ↵</button>}
             </div></div></div>
         </div>}
       </section>

@@ -11,14 +11,22 @@ export class WorkflowCompiler {
     const now = new Date().toISOString();
     const nodes: WorkflowNode[] = [
       { id: "router", label: "Router", enabled: true, type: "router", role: "router", checkpoint: "initial",
-        allowedActions: kind === "prd_driven" ? ["create_prd"] : ["execute_low", "execute_medium", "execute_high"] },
+        allowedActions: kind === "prd_driven" ? ["create_prd"]
+          : kind === "adaptive" ? ["plan", "execute_low", "execute_medium", "execute_high"]
+          : ["execute_low", "execute_medium", "execute_high"] },
       ...this.routedNodes(),
     ];
+    if (kind === "adaptive") nodes.push(
+      { id: "planning", label: "Planning", enabled: true, type: "role_task", role: "planning" },
+    );
     const edges: WorkflowEdge[] = [
       { id: "route-low", from: "router", to: "low", condition: { type: "router_action", action: "execute_low" } },
       { id: "route-medium", from: "router", to: "medium", condition: { type: "router_action", action: "execute_medium" } },
       { id: "route-high", from: "router", to: "high", condition: { type: "router_action", action: "execute_high" } },
     ];
+    if (kind === "adaptive") edges.push(
+      { id: "route-planning", from: "router", to: "planning", condition: { type: "router_action", action: "plan" } },
+    );
     if (kind === "standard") this.addCompletion(nodes, edges, ["low", "medium", "high"]);
     else if (kind === "adaptive") this.addAdaptiveFlow(nodes, edges);
     else if (kind === "review_loop" || kind === "review_documentation") {
@@ -58,7 +66,7 @@ export class WorkflowCompiler {
         operation: "create", documentKind: "custom", optional: true },
       { id: "complete", label: "Complete", enabled: true, type: "complete" },
     );
-    for (const id of ["low", "medium", "high"]) edges.push({ id: `${id}-next`, from: id, to: "route-next", condition: { type: "always" } });
+    for (const id of ["planning", "low", "medium", "high"]) edges.push({ id: `${id}-next`, from: id, to: "route-next", condition: { type: "always" } });
     edges.push(
       { id: "next-review", from: "route-next", to: "review", condition: { type: "router_action", action: "review" } },
       { id: "next-document", from: "route-next", to: "document", condition: { type: "router_action", action: "write_documentation" } },

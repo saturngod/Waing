@@ -14,7 +14,7 @@ export const stepExecutionOverrideSchema = roleExecutionProfileSchema.pick({ age
   mode: true, permissionProfileId: true }).partial().strict();
 export type StepExecutionOverride = z.infer<typeof stepExecutionOverrideSchema>;
 
-export const workflowNextActionKindSchema = z.enum(["execute_low", "execute_medium", "execute_high", "create_prd",
+export const workflowNextActionKindSchema = z.enum(["plan", "execute_low", "execute_medium", "execute_high", "create_prd",
   "update_prd", "write_documentation", "review", "fix", "ask_user", "complete"]);
 export type WorkflowNextActionKind = z.infer<typeof workflowNextActionKindSchema>;
 
@@ -28,7 +28,7 @@ export const routerNodeSchema = z.object({ ...nodeBase, type: z.literal("router"
   checkpoint: routerNodeCheckpointSchema, allowedActions: z.array(workflowNextActionKindSchema).min(1),
   instructions: z.string().optional() }).strict();
 export const roleTaskNodeSchema = z.object({ ...nodeBase, type: z.literal("role_task"),
-  role: z.enum(["low", "medium", "high", "review", "bugfix"]), instructions: z.string().optional(),
+  role: z.enum(["planning", "low", "medium", "high", "review", "bugfix"]), instructions: z.string().optional(),
   execution: stepExecutionOverrideSchema.optional() }).strict();
 /** `optional` marks a gate the router may legitimately skip, so completion is not blocked when it never ran. */
 export const documentNodeSchema = z.object({ ...nodeBase, type: z.literal("document"), role: z.literal("document"),

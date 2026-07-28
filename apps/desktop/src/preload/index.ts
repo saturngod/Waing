@@ -1,9 +1,9 @@
 import { contextBridge, ipcRenderer } from "electron";
 import { IPC_CHANNELS } from "@waing/ipc-contracts/channels";
-import type { AppInfo, ConversationHistory, DesktopApi, RoleProfilesView, SessionSendResult, WorkflowRunView } from "@waing/ipc-contracts";
+import type { AppInfo, AttachmentChoice, ConversationHistory, DesktopApi, DesktopWorkflowEvent, RoleProfilesView, SessionSendResult, WorkflowRunView } from "@waing/ipc-contracts";
 import type { z } from "zod";
 import type { workflowRunInputSchema } from "@waing/ipc-contracts";
-import type { AgentDescriptor, AgentEvent, AgentModelDescriptor, AgentSession, AppConversation, AutoSelection, PermissionDecision, Project, RoleExecutionProfile, WorkflowEvent } from "@waing/domain";
+import type { AgentDescriptor, AgentEvent, AgentModelDescriptor, AgentSession, AppConversation, AutoSelection, PermissionDecision, Project, RoleExecutionProfile } from "@waing/domain";
 
 const invoke = <T>(channel: string): Promise<T> => ipcRenderer.invoke(channel, undefined) as Promise<T>;
 
@@ -28,6 +28,13 @@ const desktopApi: DesktopApi = Object.freeze({
     refresh: () => invoke<AgentDescriptor[]>(IPC_CHANNELS.agentsRefresh),
     models: (agentId: string) => ipcRenderer.invoke(IPC_CHANNELS.agentsModels, { agentId }) as Promise<AgentModelDescriptor[]>,
   }),
+  attachments: Object.freeze({
+    choose: () => invoke<AttachmentChoice[]>(IPC_CHANNELS.attachmentsChoose),
+  }),
+  system: Object.freeze({
+    openLink: (target: string, projectId?: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.systemOpenLink, { target, ...(projectId === undefined ? {} : { projectId }) }) as Promise<void>,
+  }),
   sessions: Object.freeze({
     send: (input: Parameters<DesktopApi["sessions"]["send"]>[0]) =>
       ipcRenderer.invoke(IPC_CHANNELS.sessionsSend, input) as Promise<SessionSendResult>,
@@ -51,8 +58,8 @@ const desktopApi: DesktopApi = Object.freeze({
   workflows: Object.freeze({
     run: (input: z.infer<typeof workflowRunInputSchema>) =>
       ipcRenderer.invoke(IPC_CHANNELS.workflowsRun, input) as Promise<WorkflowRunView>,
-    onEvent: (callback: (event: WorkflowEvent) => void) => {
-      const listener = (_event: Electron.IpcRendererEvent, event: WorkflowEvent) => callback(event);
+    onEvent: (callback: (event: DesktopWorkflowEvent) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, event: DesktopWorkflowEvent) => callback(event);
       ipcRenderer.on(IPC_CHANNELS.workflowsEvent, listener);
       return () => ipcRenderer.removeListener(IPC_CHANNELS.workflowsEvent, listener);
     },

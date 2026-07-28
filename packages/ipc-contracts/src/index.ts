@@ -21,7 +21,9 @@ export interface ConversationHistory {
   events: AgentEvent[];
 }
 export const agentModelsInputSchema = z.object({ agentId: z.string().min(1) });
+export const openLinkInputSchema = z.object({ target: z.string().min(1).max(4_096), projectId: z.string().min(1).optional() }).strict();
 export const sessionSendInputSchema = z.object({ projectId: z.string().min(1), text: z.string().min(1),
+  attachmentIds: z.array(z.string().uuid()).max(10).optional(),
   agentId: z.string().min(1), model: z.string().min(1).optional(), mode: z.enum(["execute", "plan", "review", "investigate"]),
   effort: z.enum(["low", "medium", "high", "max"]).optional() });
 export const sessionCancelInputSchema = z.object({ sessionId: z.string().min(1) });
@@ -37,12 +39,16 @@ export interface SessionSendResult {
 }
 export const workflowRunInputSchema = z.object({ task: z.string().min(1), projectId: z.string().min(1),
   preset: z.enum(["standard", "review_loop", "review_documentation", "prd_driven"]),
-  profiles: z.array(roleExecutionProfileSchema).length(7) });
+  profiles: z.array(roleExecutionProfileSchema).length(8) });
 export interface WorkflowRunView { runId: string; status: string; summary?: string; steps: Array<{ nodeId: string; role: string; summary: string }>; loopState: Record<string, { iteration: number; maxIterations: number }> }
 
-export const roleProfilesInputSchema = z.object({ profiles: z.array(roleExecutionProfileSchema).length(7) });
+export const roleProfilesInputSchema = z.object({ profiles: z.array(roleExecutionProfileSchema).length(8) });
 /** `needsReview` is true while routing still runs on seeded defaults the user has neither saved nor dismissed. */
 export interface RoleProfilesView { profiles: RoleExecutionProfile[]; needsReview: boolean }
+
+/** Main-process context added to every workflow event so concurrent runs can be isolated in the renderer. */
+export type DesktopWorkflowEvent = WorkflowEvent & { workflowRunId: string; projectId: string };
+export interface AttachmentChoice { id: string; name: string; mimeType: string; kind: "image" | "file" }
 
 export interface AppInfo {
   name: string;
@@ -67,6 +73,8 @@ export interface DesktopApi {
     refresh(): Promise<AgentDescriptor[]>;
     models(agentId: string): Promise<AgentModelDescriptor[]>;
   };
+  attachments: { choose(): Promise<AttachmentChoice[]> };
+  system: { openLink(target: string, projectId?: string): Promise<void> };
   sessions: {
     send(input: z.infer<typeof sessionSendInputSchema>): Promise<SessionSendResult>;
     cancel(sessionId: string): Promise<void>;
@@ -79,7 +87,7 @@ export interface DesktopApi {
   router: { preview(task: string, projectId: string): Promise<AutoSelection> };
   workflows: {
     run(input: z.infer<typeof workflowRunInputSchema>): Promise<WorkflowRunView>;
-    onEvent(callback: (event: WorkflowEvent) => void): () => void;
+    onEvent(callback: (event: DesktopWorkflowEvent) => void): () => void;
   };
   settings: {
     roles(): Promise<RoleProfilesView>;

@@ -7,7 +7,10 @@ export interface TimelineStep { id: string; title: string; detail?: string; stat
 type ChatItem =
   | { kind: "user"; id: string; text: string }
   | { kind: "assistant"; id: string; agentId: string; text: string; streaming: boolean }
-  | { kind: "output"; id: string; agentId: string; text: string }
+  | { kind: "activity"; id: string; entries: ActivityEntry[]; pending: boolean };
+
+type ActivityEntry =
+  | { kind: "output"; id: string; text: string }
   | { kind: "event"; id: string; event: AgentEvent; repeats: number };
 
 /**
@@ -45,29 +48,45 @@ function buildChat(events: AgentEvent[], prompt: string | undefined): ChatItem[]
   const items: ChatItem[] = [];
   if (prompt !== undefined && prompt.length > 0) items.push({ kind: "user", id: "prompt", text: prompt });
   let bubble: Extract<ChatItem, { kind: "assistant" }> | undefined;
-  let output: Extract<ChatItem, { kind: "output" }> | undefined;
+  let activity: Extract<ChatItem, { kind: "activity" }> | undefined;
   for (const event of events) {
     if (event.type === "message.delta" || event.type === "message.completed") {
-      output = undefined;
+      if (activity !== undefined) activity.pending = false;
+      activity = undefined;
       if (bubble === undefined) { bubble = { kind: "assistant", id: event.id, agentId: event.agentId, text: "", streaming: true }; items.push(bubble); }
       if (event.type === "message.delta") bubble.text += event.text;
       else { if (event.text.length > 0) bubble.text = event.text; bubble.streaming = false; bubble = undefined; }
       continue;
     }
-    if (event.type === "command.output") {
-      bubble = undefined;
-      if (output === undefined) { output = { kind: "output", id: event.id, agentId: event.agentId, text: "" }; items.push(output); }
-      output.text += event.text;
-      continue;
-    }
     // Suppressed ticks arrive mid-stream, so they must not split the message they interleave with either.
     if (SUPPRESSED.has(event.type)) continue;
-    bubble = undefined; output = undefined;
-    const previous = items.at(-1);
+    bubble = undefined;
+    if (activity === undefined) { activity = { kind: "activity", id: `activity-${event.id}`, entries: [], pending: true }; items.push(activity); }
+    const previous = activity.entries.at(-1);
+    if (event.type === "command.output") {
+      if (previous?.kind === "output") previous.text += event.text;
+      else activity.entries.push({ kind: "output", id: event.id, text: event.text });
+      continue;
+    }
     if (previous?.kind === "event" && sameActivity(previous.event, event)) { previous.repeats += 1; continue; }
-    items.push({ kind: "event", id: event.id, event, repeats: 1 });
+    activity.entries.push({ kind: "event", id: event.id, event, repeats: 1 });
+    if (event.type === "run.completed" || event.type === "run.failed") activity.pending = false;
   }
   return items;
+}
+
+function activitySummary(item: Extract<ChatItem, { kind: "activity" }>): string {
+  const events = item.entries.flatMap((entry) => entry.kind === "event" ? [entry.event] : []);
+  const latestCommand = [...events].reverse().find((event) => event.type === "command.started");
+  if (item.pending) return latestCommand?.type === "command.started" ? `Running ${latestCommand.command.join(" ")}` : "Working…";
+  const started = events[0]?.timestamp; const finished = events.at(-1)?.timestamp;
+  const seconds = started === undefined || finished === undefined ? 0
+    : Math.max(0, Math.round((Date.parse(finished) - Date.parse(started)) / 1_000));
+  const duration = seconds > 0 ? ` in ${String(seconds)}s` : "";
+  if (latestCommand?.type === "command.started" && events.filter((event) => event.type === "command.started").length === 1) {
+    return `Ran ${latestCommand.command.join(" ")}${duration}`;
+  }
+  return `${String(item.entries.length)} activities${duration}`;
 }
 
 /** Providers often report the same file write or command twice; identical neighbours collapse into one row. */
@@ -77,12 +96,14 @@ function sameActivity(left: AgentEvent, right: AgentEvent): boolean {
   return a.title === b.title && a.detail === b.detail;
 }
 
-export function ActivityTimeline({ events, prompt, steps = [], model, effort, agentMeta = {}, replayText }: {
+export function ActivityTimeline({ events, prompt, steps = [], model, effort, agentMeta = {}, replayText, projectId }: {
   events: AgentEvent[]; prompt?: string; steps?: TimelineStep[]; model?: string; effort?: string;
-  agentMeta?: Record<string, string>; replayText?: string;
+  agentMeta?: Record<string, string>; replayText?: string; projectId?: string;
 }) {
   const items = buildChat(events, prompt);
   const fallbackLabel = [model, effort].filter((part) => part !== undefined && part.length > 0).join(" · ");
+  const working = items.some((item) => item.kind === "activity" && item.pending)
+    || steps.some((step) => step.state === "pending");
 
   const renderItem = (item: ChatItem) => {
     if (item.kind === "user") return <article className="chat-turn user" key={item.id}><div className="bubble">{item.text}</div></article>;
@@ -94,20 +115,23 @@ export function ActivityTimeline({ events, prompt, steps = [], model, effort, ag
         {/* Mid-stream text is often half a fence or table row, so it stays literal until the message settles. */}
         <div className="chat-text">{item.streaming
           ? <>{item.text}<span className="caret" aria-label="Streaming" /></>
-          : <Markdown text={item.text} />}</div>
+          : <Markdown text={item.text} {...(projectId === undefined ? {} : { projectId })} />}</div>
       </article>;
     }
-    if (item.kind === "output") return <details className="chat-output" key={item.id}>
-      <summary>Command output</summary><pre>{item.text}</pre>
+    return <details className={`activity-group ${item.pending ? "pending" : "done"}`} key={item.id}>
+      <summary><span className="activity-spinner" aria-hidden="true" /><span>{activitySummary(item)}</span><span className="activity-chevron">⌄</span></summary>
+      <div className="activity-group-items">{item.entries.map((entry) => {
+        if (entry.kind === "output") return <pre className="activity-output" key={entry.id}>{entry.text}</pre>;
+        const content = activityText(entry.event);
+        const state = entry.event.type.includes("failed") ? "failed" : entry.event.type.includes("completed") ? "done" : "";
+        return <div className={`chat-activity ${state}`} key={entry.id}>
+          <span className="chat-dot">{state === "failed" ? "!" : state === "done" ? "✓" : "·"}</span>
+          <span className="chat-activity-title">{content.title}</span>
+          {content.detail !== undefined && <span className="chat-activity-detail">{content.detail}</span>}
+          {entry.repeats > 1 && <span className="chat-activity-count">×{entry.repeats}</span>}
+        </div>;
+      })}</div>
     </details>;
-    const content = activityText(item.event);
-    const state = item.event.type.includes("failed") ? "failed" : item.event.type.includes("completed") ? "done" : "";
-    return <div className={`chat-activity ${state}`} key={item.id}>
-      <span className="chat-dot">{state === "failed" ? "!" : state === "done" ? "✓" : "·"}</span>
-      <span className="chat-activity-title">{content.title}</span>
-      {content.detail !== undefined && <span className="chat-activity-detail">{content.detail}</span>}
-      {item.repeats > 1 && <span className="chat-activity-count">×{item.repeats}</span>}
-    </div>;
   };
 
   return <section className="timeline" aria-label="Conversation">
@@ -115,13 +139,14 @@ export function ActivityTimeline({ events, prompt, steps = [], model, effort, ag
     {items.filter((item) => item.kind === "user").map(renderItem)}
     {/* Routing runs before the provider starts, so its steps sit between the prompt and the first provider event. */}
     {steps.map((step) => <div className={`chat-activity ${step.state ?? ""}`} key={step.id}>
-      <span className="chat-dot">{step.state === "failed" ? "!" : step.state === "done" ? "✓" : "◇"}</span>
+      <span className="chat-dot">{step.state === "failed" ? "!" : step.state === "done" ? "✓" : ""}</span>
       <span className="chat-activity-title">{step.title}</span>
       {step.detail !== undefined && <span className="chat-activity-detail">{step.detail}</span>}
     </div>)}
     {/* Older runs stored only a summary message, with no message event to rebuild a bubble from. */}
     {replayText !== undefined && <article className="chat-turn agent"><div className="chat-author">summary</div>
-      <div className="chat-text"><Markdown text={replayText} /></div></article>}
+      <div className="chat-text"><Markdown text={replayText} {...(projectId === undefined ? {} : { projectId })} /></div></article>}
     {items.filter((item) => item.kind !== "user").map(renderItem)}
+    {working && <div className="task-loading" role="status" aria-label="Agent is working"><i /><i /><i /></div>}
   </section>;
 }

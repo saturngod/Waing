@@ -14,10 +14,10 @@ import { InMemoryWorkflowRepository } from "./WorkflowRepository";
 import { WorkflowRunCoordinator } from "./WorkflowRunCoordinator";
 import { WorkflowValidator } from "./WorkflowValidator";
 
-const profiles = Object.fromEntries((["router", "low", "medium", "high", "review", "bugfix", "document"] as WorkflowRole[])
+const profiles = Object.fromEntries((["router", "planning", "low", "medium", "high", "review", "bugfix", "document"] as WorkflowRole[])
   .map((role) => [role, { role, enabled: true, agentId: role === "high" ? "claude" : role === "review" ? "antigravity"
     : role === "document" || role === "router" ? "opencode" : "codex", modelId: `${role}-model`,
-    effort: role === "low" || role === "router" ? "low" : "medium", mode: role === "review" ? "review" : "execute",
+    effort: role === "low" || role === "router" ? "low" : "medium", mode: role === "review" ? "review" : role === "planning" ? "plan" : "execute",
     permissionProfileId: "ask", timeoutMs: 10_000, maxRetries: 0 } satisfies RoleExecutionProfile])) as GlobalRoleProfiles;
 
 class QueueRouter implements WorkflowRouter {
@@ -198,6 +198,17 @@ describe("WorkflowEngine", () => {
       task: "Explain this function" });
     expect(result.run.status).toBe("completed");
     expect(executor.calls.map((call) => call.node.id)).toEqual(["low"]);
+  });
+
+  it("routes plan-only requests through the Planning role", async () => {
+    const executor = new FakeStepExecutor();
+    const result = await new WorkflowEngine(new InMemoryWorkflowRepository(), executor,
+      new QueueRouter([decision("plan"), decision("complete")])).run({
+      definition: new WorkflowCompiler().compilePreset("adaptive"), profiles, projectId: "p", projectRoot: "/tmp",
+      task: "Create an implementation plan without changing files" });
+    expect(result.run.status).toBe("completed");
+    expect(executor.calls.map((call) => call.node.id)).toEqual(["planning"]);
+    expect(executor.calls[0]?.profile).toMatchObject({ role: "planning", mode: "plan" });
   });
 
   it("gives the adaptive reviewer the implementation diff and loops through bugfix on FAIL", async () => {

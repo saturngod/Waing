@@ -13,6 +13,7 @@ import type { ThreadResumeResponse } from "../generated/v2/ThreadResumeResponse"
 import type { ThreadStartResponse } from "../generated/v2/ThreadStartResponse";
 import type { TurnStartResponse } from "../generated/v2/TurnStartResponse";
 import type { ThreadItem } from "../generated/v2/ThreadItem";
+import type { UserInput } from "../generated/v2/UserInput";
 
 interface SessionState {
   session: AgentSession;
@@ -105,9 +106,16 @@ export class CodexAdapter implements CodingAgent {
   async send(sessionId: string, request: AgentRequest): Promise<AgentRun> {
     const state = this.requireSession(sessionId);
     const transport = await this.ensureTransport();
+    const input: UserInput[] = [{ type: "text", text: request.text, text_elements: [] }];
+    for (const attachment of request.attachments ?? []) {
+      if (attachment.path === undefined) continue;
+      input.push(attachment.mimeType.startsWith("image/")
+        ? { type: "localImage", path: attachment.path }
+        : { type: "mention", name: attachment.name, path: attachment.path });
+    }
     const response = await transport.request<TurnStartResponse>("turn/start", {
       threadId: state.providerThreadId,
-      input: [{ type: "text", text: request.text, text_elements: [] }],
+      input,
       cwd: request.projectRoot,
       ...(request.model === undefined ? {} : { model: request.model }),
       ...(request.effort === undefined ? {} : { effort: request.effort }),

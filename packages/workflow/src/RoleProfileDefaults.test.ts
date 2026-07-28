@@ -18,6 +18,7 @@ describe("default role profiles", () => {
     expect(profiles.every((profile) => ["codex", "claude"].includes(profile.agentId))).toBe(true);
     expect(profiles.find((profile) => profile.role === "high")?.agentId).toBe("claude");
     expect(profiles.find((profile) => profile.role === "review")?.mode).toBe("review");
+    expect(profiles.find((profile) => profile.role === "planning")?.mode).toBe("plan");
   });
 
   it("prefers a usable provider over one that is installed but not authenticated", () => {

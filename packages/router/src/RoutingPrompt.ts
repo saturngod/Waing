@@ -29,11 +29,13 @@ Return one JSON object only, with exactly these fields and no others:
 - confidence: number between 0 and 1
 
 Optional fields, only when they apply:
-- complexity: low|medium|high, and taskType: question|bugfix|feature|refactor|investigation|planning|review|testing|documentation, when choosing an execute_* action
+- complexity: low|medium|high, and taskType: question|bugfix|feature|refactor|investigation|planning|review|testing|documentation, when choosing plan or an execute_* action
 - effortHint: low|medium|high|max
 - document: { "operation": create|update, "kind": prd|readme|architecture|changelog|custom, "targetPath": string } — REQUIRED for create_prd, update_prd, and write_documentation; set targetPath to the file the user asked for
 
 Example: {"action":"execute_medium","complexity":"medium","taskType":"feature","statusIntent":{"activity":"implementing"},"rationale":"Several components with moderate risk.","confidence":0.86}
+
+Choose "plan" for a request whose desired output is a plan rather than implemented changes.
 
 Never mention a provider or agent name anywhere in the output.`;
 

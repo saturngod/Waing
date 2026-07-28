@@ -1,6 +1,7 @@
 import type { AutoSelection } from "@waing/domain";
 
 const roleLabels = {
+  planning: "Planning",
   low: "Low Level Task", medium: "Medium Level Task", high: "High Level Task",
   review: "Review Level Task", bugfix: "Bug Fixing Task", document: "Document Task",
 } as const;

@@ -21,6 +21,7 @@ The app must let a user:
 3. Use a **user-selected router agent/model** as a re-entrant control-plane step that can run at the beginning and again after new artifacts/results change what should happen next.
 4. Let the Router choose only a logical next action/role such as:
    - Low Level Task
+   - Planning Task
    - Medium Level Task
    - High Level Task
    - Review Level Task
@@ -33,11 +34,12 @@ The app must let a user:
    - `Router → Create PRD → Router → Low/Medium/High → Router → Review ⇄ Fix → Router → Update PRD → Router → Complete`
 7. Before each executable step, show a chat/activity message identifying the actual resolved worker, for example `Opus 4.8 is fixing the bugs`.
 8. Start or resume the selected coding agent for each workflow step.
-9. Stream the agent's activity into one common timeline.
-10. Show file reads, file edits, diffs, commands, tool calls, messages, plans, errors, usage, router decisions, and permission requests.
-11. Let the user approve or deny sensitive actions from the desktop UI.
-12. Maintain provider-specific sessions while exposing one provider-neutral session/workflow model to the UI.
-13. Allow the user to switch agents without coupling the entire application to any single vendor.
+9. Stream the agent's activity into one common timeline, grouping informational tool activity into collapsed-by-default sections that remain expandable.
+10. Show file reads, file edits, diffs, commands, tool calls, messages, plans, errors, usage, router decisions, permission requests, and a live loading indicator.
+11. Open safe web links and project-scoped local file links with the operating system's default application.
+12. Let the user approve or deny sensitive actions from the desktop UI.
+13. Maintain provider-specific sessions while exposing one provider-neutral session/workflow model to the UI.
+14. Allow the user to switch agents without coupling the entire application to any single vendor.
 
 ### Recommended provider integration paths
 
@@ -1557,6 +1559,7 @@ Waing must ship with these built-in logical roles:
 ```ts
 export type WorkflowRole =
   | "router"
+  | "planning"
   | "low"
   | "medium"
   | "high"
@@ -1570,6 +1573,7 @@ User-facing names:
 | Role | UI label | Purpose |
 |---|---|---|
 | `router` | Router | Classify the incoming task and choose the configured route |
+| `planning` | Planning | Analyze the request and produce a plan without implementing changes |
 | `low` | Low Level Task | Small, narrow, low-risk execution |
 | `medium` | Medium Level Task | Moderate multi-file work or investigation |
 | `high` | High Level Task | Complex/high-risk implementation or architecture work |
@@ -2106,6 +2110,7 @@ export type RouterCheckpointReason =
   | "recovery";
 
 export type WorkflowNextActionKind =
+  | "plan"
   | "execute_low"
   | "execute_medium"
   | "execute_high"

@@ -9,6 +9,8 @@ export const IPC_CHANNELS = {
   agentsList: "agents:list",
   agentsRefresh: "agents:refresh",
   agentsModels: "agents:models",
+  attachmentsChoose: "attachments:choose",
+  systemOpenLink: "system:open-link",
   sessionsSend: "sessions:send",
   sessionsCancel: "sessions:cancel",
   sessionsRunFake: "sessions:run-fake",

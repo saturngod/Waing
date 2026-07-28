@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const workflowRoleSchema = z.enum(["router", "low", "medium", "high", "review", "bugfix", "document"]);
+export const workflowRoleSchema = z.enum(["router", "planning", "low", "medium", "high", "review", "bugfix", "document"]);
 export type WorkflowRole = z.infer<typeof workflowRoleSchema>;
 export type ExecutionWorkflowRole = Exclude<WorkflowRole, "router">;
 
