@@ -5,9 +5,8 @@
 
 ![](./assets/meme.jpg)
 
-Waing is a local, provider-neutral Electron workspace for coding agents. You write one prompt; a router picks the
-right role for the task, runs it with the provider you assigned to that role, and decides whether the work still
-needs a review or a document before it is done.
+Waing is a local, provider-neutral Electron workspace for coding agents. You create a roster of agents with distinct
+jobs and instructions; a router picks the right agent for each step and decides when the request is complete.
 
 Everything runs on your machine against CLIs you already have installed. Waing never holds provider credentials.
 
@@ -18,19 +17,18 @@ Everything runs on your machine against CLIs you already have installed. Waing n
 ```
 prompt
   ↓
-router ─────────────► picks a role from the task (low | medium | high)
+router ─────────────► picks an agent by its "where to use" description
   ↓
-role task ──────────► the provider saved for that role does the work
+agent task ─────────► the selected agent follows its saved instructions
   ↓
-router checkpoint ──┬─ review ──► bugfix ──► (loop, max 3) ──┐
-                    ├─ document ─────────────────────────────┤
-                    └─ done ◄────────────────────────────────┘
+router checkpoint ──┬─ another agent ──► router checkpoint
+                    ├─ ask user
+                    └─ complete
 ```
 
 The chat transcript shows each stage as it happens: the routing decision, which provider and model took the step,
-its messages, tools, file writes, and commands. Review and documentation are optional — a question finishes right
-after the task step, while "build the site, then write finaldocument.md" fans out to an implementer and a doc
-writer without a second prompt.
+its messages, tools, file writes, and commands. A Planner, Reviewer, Test Writer, or any user-created specialist can
+run in sequence without another prompt.
 
 ## Providers (ဝိုင်းတော်သားများ)
 
@@ -56,16 +54,15 @@ npm install
 npm run dev        # Electron + React renderer
 ```
 
-Open a project folder, then send a message. First launch seeds a role configuration from the providers you actually
-have and flags it for review.
+Open a project folder, then send a message. First launch seeds five starter agents from the providers you actually
+have and flags them for review.
 
 ## Configuration
 
 Settings is global — it applies to every project:
 
-- Roles & routing — for each role (router, low, medium, high, review, bugfix, document) choose the provider,
-model, reasoning effort, mode, and permission profile. Auto routing classifies the task, then runs it with the
-provider you assigned to the matching role.
+- Agents — create, edit, reorder, enable, and delete agents; give each a routing description, instructions, provider,
+model, reasoning effort, and permission profile. Model choices update after the provider changes. Router controls live here too.
 - Provider status — which CLIs were found and their detected versions. Sign-in state is not probed yet.
 - Diagnostics — export a redacted diagnostics bundle.
 
@@ -101,8 +98,8 @@ domain → agent-core → adapters → router | workflow | persistence → apps/
 | `@waing/domain` | zod schemas and types for everything crossing a boundary, plus `AgentError` |
 | `@waing/agent-core` | the `CodingAgent` contract, `AgentManager`, permissions, sessions, process/protocol layer |
 | `adapter-*` | one per provider; raw provider protocol types never leave the package |
-| `@waing/router` | task classification and workflow checkpoints, validated against a schema and an action allowlist |
-| `@waing/workflow` | the node/edge engine, presets, role profiles, and the bridge to `AgentManager` |
+| `@waing/router` | roster-based workflow checkpoints, validated against available agent ids and an action allowlist |
+| `@waing/workflow` | the adaptive node/edge engine, agent profiles, and the bridge to `AgentManager` |
 | `@waing/persistence` | `node:sqlite` with forward-only numbered migrations |
 
 ## Security

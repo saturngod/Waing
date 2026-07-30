@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AgentManager } from "@waing/agent-core";
 import { AgentError } from "@waing/domain";
-import type { AgentEvent } from "@waing/domain";
+import type { AgentEvent, EffortLevel } from "@waing/domain";
 import { parseRouterJson } from "./parseRouterJson";
 import type { RouterClient } from "./RouterManager";
 
@@ -12,6 +12,7 @@ export interface AgentRouterClientOptions {
   projectId: string;
   projectRoot: string;
   model?: string;
+  effort?: EffortLevel;
   /** Called with each routing session id so the host can keep router chatter out of the chat transcript. */
   onSession?: (sessionId: string) => void;
 }
@@ -47,7 +48,8 @@ export class AgentRouterClient implements RouterClient {
       await this.options.agents.send(session.id, { text: prompt, projectRoot: this.options.projectRoot,
         // Plan mode keeps a capable provider read-only; anything without it is held to the prompt's own restrictions.
         mode: capabilities.planMode ? "plan" : "execute",
-        ...(capabilities.modelSelection && this.options.model !== undefined ? { model: this.options.model } : {}) });
+        ...(capabilities.modelSelection && this.options.model !== undefined ? { model: this.options.model } : {}),
+        ...(capabilities.effortControl && this.options.effort !== undefined ? { effort: this.options.effort } : {}) });
       const event = await terminal;
       if (event.type === "run.failed") throw new AgentError("ROUTER_FAILED", event.message, this.id, event.retryable);
       return parseRouterJson(text, this.id);

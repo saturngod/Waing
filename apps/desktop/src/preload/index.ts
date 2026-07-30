@@ -1,9 +1,7 @@
 import { contextBridge, ipcRenderer } from "electron";
 import { IPC_CHANNELS } from "@waing/ipc-contracts/channels";
-import type { AppInfo, AttachmentChoice, AttachmentUpload, ConversationHistory, DesktopApi, DesktopWorkflowEvent, RoleProfilesView, SessionSendResult, WorkflowRunView } from "@waing/ipc-contracts";
-import type { z } from "zod";
-import type { workflowRunInputSchema } from "@waing/ipc-contracts";
-import type { AgentDescriptor, AgentEvent, AgentModelDescriptor, AgentQuestionResponse, AgentSession, AppConversation, AutoSelection, PermissionDecision, Project, RoleExecutionProfile, WorkspaceFileMatches } from "@waing/domain";
+import type { AgentSettingsView, AppInfo, AttachmentChoice, AttachmentUpload, ConversationHistory, DesktopApi, DesktopWorkflowEvent, SessionSendResult } from "@waing/ipc-contracts";
+import type { AgentDescriptor, AgentEvent, AgentModelDescriptor, AgentProfile, AgentQuestionResponse, AgentSession, AppConversation, PermissionDecision, Project, RouterSettings, WorkspaceFileMatches } from "@waing/domain";
 
 const invoke = <T>(channel: string): Promise<T> => ipcRenderer.invoke(channel, undefined) as Promise<T>;
 
@@ -63,13 +61,7 @@ const desktopApi: DesktopApi = Object.freeze({
     respond: (sessionId: string, questionId: string, answers: AgentQuestionResponse) =>
       ipcRenderer.invoke(IPC_CHANNELS.questionsRespond, { sessionId, questionId, answers }) as Promise<void>,
   }),
-  router: Object.freeze({
-    preview: (task: string, projectId: string) =>
-      ipcRenderer.invoke(IPC_CHANNELS.routerPreview, { task, projectId }) as Promise<AutoSelection>,
-  }),
   workflows: Object.freeze({
-    run: (input: z.infer<typeof workflowRunInputSchema>) =>
-      ipcRenderer.invoke(IPC_CHANNELS.workflowsRun, input) as Promise<WorkflowRunView>,
     onEvent: (callback: (event: DesktopWorkflowEvent) => void) => {
       const listener = (_event: Electron.IpcRendererEvent, event: DesktopWorkflowEvent) => callback(event);
       ipcRenderer.on(IPC_CHANNELS.workflowsEvent, listener);
@@ -77,10 +69,10 @@ const desktopApi: DesktopApi = Object.freeze({
     },
   }),
   settings: Object.freeze({
-    roles: () => invoke<RoleProfilesView>(IPC_CHANNELS.settingsRolesGet),
-    saveRoles: (profiles: RoleExecutionProfile[]) =>
-      ipcRenderer.invoke(IPC_CHANNELS.settingsRolesSave, { profiles }) as Promise<RoleProfilesView>,
-    acknowledgeRouting: () => invoke<void>(IPC_CHANNELS.settingsRolesAcknowledge),
+    agents: () => invoke<AgentSettingsView>(IPC_CHANNELS.settingsAgentsGet),
+    saveAgents: (profiles: AgentProfile[], router: RouterSettings) =>
+      ipcRenderer.invoke(IPC_CHANNELS.settingsAgentsSave, { profiles, router }) as Promise<AgentSettingsView>,
+    acknowledgeRouting: () => invoke<void>(IPC_CHANNELS.settingsAgentsAcknowledge),
   }),
   diagnostics: Object.freeze({
     export: () => invoke<string | null>(IPC_CHANNELS.diagnosticsExport),

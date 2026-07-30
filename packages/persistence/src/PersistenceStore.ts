@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type {
-  AgentEvent, AppConversation, PermissionDecision, PermissionRequest, Project, RoleExecutionProfile,
-  RoutingDecision, RoutingRule, StepAnnouncement,
+  AgentEvent, AgentProfile, AppConversation, PermissionDecision, PermissionRequest, Project, StepAnnouncement,
 } from "@waing/domain";
 import type { SqliteDatabase } from "./SqliteDatabase";
 
@@ -42,7 +41,6 @@ export class PersistenceStore {
       `DELETE FROM messages WHERE conversation_id IN (${conversationScope})`,
       `DELETE FROM provider_sessions WHERE conversation_id IN (${conversationScope})`,
       `DELETE FROM agent_events WHERE conversation_id IN (${conversationScope})`,
-      `DELETE FROM routing_decisions WHERE conversation_id IN (${conversationScope})`,
       "DELETE FROM permission_decisions WHERE project_id=?",
       "DELETE FROM conversations WHERE project_id=?",
       "DELETE FROM projects WHERE id=?",
@@ -71,7 +69,7 @@ export class PersistenceStore {
   }
   removeConversation(conversationId: string): void {
     const statements = ["DELETE FROM messages WHERE conversation_id=?", "DELETE FROM provider_sessions WHERE conversation_id=?",
-      "DELETE FROM agent_events WHERE conversation_id=?", "DELETE FROM routing_decisions WHERE conversation_id=?",
+      "DELETE FROM agent_events WHERE conversation_id=?",
       "DELETE FROM conversations WHERE id=?"];
     this.database.connection.exec("BEGIN");
     try {
@@ -126,24 +124,16 @@ export class PersistenceStore {
     this.database.connection.prepare("INSERT INTO permission_decisions(id,project_id,session_id,request_id,decision,request_json,created_at) VALUES(?,?,?,?,?,?,?)")
       .run(randomUUID(), projectId, request.sessionId, request.id, decision, JSON.stringify(request), new Date().toISOString());
   }
-  saveRoutingDecision(conversationId: string, decision: RoutingDecision): void {
-    this.database.connection.prepare("INSERT INTO routing_decisions(id,conversation_id,workflow_run_id,kind,decision_json,created_at) VALUES(?,?,?,?,?,?)")
-      .run(randomUUID(), conversationId, null, "classification", JSON.stringify(decision), new Date().toISOString());
+  saveAgentProfile(profile: AgentProfile): void {
+    this.database.connection.prepare(`INSERT INTO agent_profiles(id,profile_json,position,updated_at) VALUES(?,?,?,?)
+      ON CONFLICT(id) DO UPDATE SET profile_json=excluded.profile_json,position=excluded.position,updated_at=excluded.updated_at`)
+      .run(profile.id, JSON.stringify(profile), profile.position, new Date().toISOString());
   }
-  saveRoutingRule(rule: RoutingRule): void {
-    this.database.connection.prepare("INSERT INTO routing_rules(id,rule_json,updated_at) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET rule_json=excluded.rule_json,updated_at=excluded.updated_at")
-      .run(rule.id, JSON.stringify(rule), new Date().toISOString());
+  listAgentProfiles(): AgentProfile[] {
+    const rows = this.database.connection.prepare("SELECT profile_json FROM agent_profiles ORDER BY position,id").all() as { profile_json: string }[];
+    return rows.map((row) => JSON.parse(row.profile_json) as AgentProfile);
   }
-  saveRoleProfile(scope: "global" | "workflow", scopeId: string, profile: RoleExecutionProfile): void {
-    this.database.connection.prepare(`INSERT INTO workflow_role_profiles(scope,scope_id,role,profile_json,updated_at) VALUES(?,?,?,?,?)
-      ON CONFLICT(scope,scope_id,role) DO UPDATE SET profile_json=excluded.profile_json,updated_at=excluded.updated_at`)
-      .run(scope, scopeId, profile.role, JSON.stringify(profile), new Date().toISOString());
-  }
-  listRoleProfiles(scope: "global" | "workflow", scopeId: string): RoleExecutionProfile[] {
-    const rows = this.database.connection.prepare("SELECT profile_json FROM workflow_role_profiles WHERE scope=? AND scope_id=?")
-      .all(scope, scopeId) as { profile_json: string }[];
-    return rows.map((row) => JSON.parse(row.profile_json) as RoleExecutionProfile);
-  }
+  removeAgentProfile(id: string): void { this.database.connection.prepare("DELETE FROM agent_profiles WHERE id=?").run(id); }
   saveAnnouncement(announcement: StepAnnouncement): void {
     this.database.connection.prepare("INSERT OR REPLACE INTO workflow_announcements(step_run_id,workflow_run_id,announcement_json,created_at) VALUES(?,?,?,?)")
       .run(announcement.stepRunId, announcement.workflowRunId, JSON.stringify(announcement), announcement.createdAt);

@@ -8,17 +8,16 @@ import { CodexAdapter } from "@waing/adapter-codex";
 import { ClaudeAdapter } from "@waing/adapter-claude";
 import { AntigravityAdapter } from "@waing/adapter-antigravity";
 import { OpenCodeAdapter } from "@waing/adapter-opencode";
-import { AgentRouterClient, AutoSelector, OpenCodeRouterClient, RouterManager } from "@waing/router";
+import { AgentRouterClient, OpenCodeRouterClient, RouterManager } from "@waing/router";
 import type { RouterClient } from "@waing/router";
-import { ADAPTIVE_ROUTER_POLICY, AgentStepExecutor, InMemoryWorkflowRepository, ROLE_ORDER, WorkflowCompiler,
-  WorkflowEngine, WorkflowEventBus, WorkflowValidator, buildDefaultRoleProfiles, sortRoleProfiles } from "@waing/workflow";
-import type { GlobalRoleProfiles } from "@waing/workflow";
+import { AgentStepExecutor, InMemoryWorkflowRepository, WorkflowCompiler,
+  WorkflowEngine, WorkflowEventBus, WorkflowValidator, buildDefaultRouterSettings, buildStarterAgentProfiles, sortAgentProfiles } from "@waing/workflow";
 import { PersistenceStore, SqliteDatabase, SqliteWorkflowRepository } from "@waing/persistence";
 import { IPC_CHANNELS, agentModelsInputSchema, conversationIdInputSchema, conversationRemoveInputSchema, emptyInputSchema,
-  attachmentChoiceSchema, attachmentsAddInputSchema, fileSearchInputSchema, permissionResponseInputSchema, questionResponseInputSchema, projectIdInputSchema, roleProfilesInputSchema, routerPreviewInputSchema, runFakeInputSchema,
-  sessionCancelInputSchema, sessionSendInputSchema, workflowRunInputSchema, openLinkInputSchema } from "@waing/ipc-contracts";
-import type { AttachmentChoice, ConversationHistory, RoleProfilesView, SessionSendResult } from "@waing/ipc-contracts";
-import type { AgentDescriptor, AgentRequest, AppConversation, Project, RoleExecutionProfile } from "@waing/domain";
+  agentSettingsInputSchema, attachmentChoiceSchema, attachmentsAddInputSchema, fileSearchInputSchema, permissionResponseInputSchema, questionResponseInputSchema, projectIdInputSchema, runFakeInputSchema,
+  sessionCancelInputSchema, sessionSendInputSchema, openLinkInputSchema } from "@waing/ipc-contracts";
+import type { AgentSettingsView, AttachmentChoice, ConversationHistory, SessionSendResult } from "@waing/ipc-contracts";
+import type { AgentDescriptor, AgentProfile, AgentRequest, AppConversation, Project, RouterSettings } from "@waing/domain";
 import { FakeAgent } from "./FakeAgent";
 import { SecretStore } from "./SecretStore";
 
@@ -147,19 +146,17 @@ const ROUTING_ACKNOWLEDGED_SETTING = "routing.acknowledged";
  * Role profiles are the single source of truth for which provider runs which role. Settings owns them; the first
  * launch seeds them from the providers that are actually installed and flags the result for review.
  */
-async function resolveRoleProfiles(): Promise<RoleProfilesView> {
-  const stored = persistence?.listRoleProfiles("global", "default") ?? [];
+async function resolveAgentProfiles(): Promise<AgentSettingsView> {
+  const stored = persistence?.listAgentProfiles() ?? [];
   const configured = persistence?.getSetting<boolean>(ROUTING_CONFIGURED_SETTING) === true;
   const acknowledged = persistence?.getSetting<boolean>(ROUTING_ACKNOWLEDGED_SETTING) === true;
-  const storedRoles = new Set(stored.map((profile) => profile.role));
-  if (stored.length === ROLE_ORDER.length && ROLE_ORDER.every((role) => storedRoles.has(role))) {
-    return { profiles: sortRoleProfiles(stored), needsReview: !configured && !acknowledged };
-  }
-  const seeded = buildDefaultRoleProfiles(await agentManager.discoverAll());
-  const existing = new Map(stored.map((profile) => [profile.role, profile]));
-  const migrated = seeded.map((profile) => existing.get(profile.role) ?? profile);
-  for (const profile of migrated) persistence?.saveRoleProfile("global", "default", profile);
-  return { profiles: migrated, needsReview: !configured && !acknowledged };
+  const descriptors = await agentManager.discoverAll();
+  const router = persistence?.getSetting<RouterSettings>("router.settings") ?? buildDefaultRouterSettings(descriptors);
+  if (stored.length > 0) return { profiles: sortAgentProfiles(stored), router, needsReview: !configured && !acknowledged };
+  const seeded = buildStarterAgentProfiles(descriptors);
+  for (const profile of seeded) persistence?.saveAgentProfile(profile);
+  persistence?.setSetting("router.settings", router);
+  return { profiles: seeded, router, needsReview: !configured && !acknowledged };
 }
 
 /**
@@ -167,7 +164,7 @@ async function resolveRoleProfiles(): Promise<RoleProfilesView> {
  * that switches every tool off at the protocol level; any other provider runs the routing prompt through its own
  * adapter. Passing a model that belongs to one provider to a different one is what made a non-OpenCode router hang.
  */
-function createRouterClient(profile: RoleExecutionProfile | undefined, project: Project,
+function createRouterClient(profile: RouterSettings | undefined, project: Project,
   onRouterSession?: (sessionId: string) => void): RouterClient & { shutdown(): Promise<void> } {
   const model = profile?.modelId;
   // "default" is a placeholder some model lists expose; it must never be forwarded as a real model id.
@@ -177,6 +174,7 @@ function createRouterClient(profile: RoleExecutionProfile | undefined, project: 
   }
   return new AgentRouterClient({ agents: agentManager, agentId: profile.agentId, projectId: project.id,
     projectRoot: project.root, ...(usableModel === undefined ? {} : { model: usableModel }),
+    ...(profile.effort === undefined ? {} : { effort: profile.effort }),
     onSession: (sessionId) => { routerSessionIds.add(sessionId); onRouterSession?.(sessionId); } });
 }
 
@@ -187,19 +185,18 @@ function createRouterClient(profile: RoleExecutionProfile | undefined, project: 
  */
 async function runChatWorkflow(project: Project, task: string, workflowTask = task,
   existingConversation?: AppConversation): Promise<SessionSendResult> {
-  const { profiles } = await resolveRoleProfiles();
-  await assertRolesUsable(profiles);
-  const routerProfile = profiles.find((profile) => profile.role === "router");
-  const definition = new WorkflowCompiler().compilePreset("adaptive");
+  const { profiles, router } = await resolveAgentProfiles();
+  await assertAgentsUsable(profiles);
+  const definition = new WorkflowCompiler().compileAdaptive(profiles);
   const repository = workflowRepository ?? new InMemoryWorkflowRepository();
   await repository.saveDefinition(definition);
   const ownedRouterSessionIds = new Set<string>();
-  const routerClient = createRouterClient(routerProfile, project, (sessionId) => ownedRouterSessionIds.add(sessionId));
+  const routerClient = createRouterClient(router, project, (sessionId) => ownedRouterSessionIds.add(sessionId));
   // A router call may have to cold-start a provider CLI, which routinely outlasts the 15s library default. The chat
   // preset consults the router after every step, so it also needs the larger decision budget that loop is sized for.
   const engine = new WorkflowEngine(repository, new AgentStepExecutor(agentManager),
     new RouterManager(routerClient, ROUTER_TIMEOUT_MS), new WorkflowEventBus(), new WorkflowValidator(),
-    ADAPTIVE_ROUTER_POLICY);
+    { maxRouterDecisions: 20, maxSameActionWithoutStateChange: 2, onExhausted: "ask_user" });
   const title = existingConversation?.title ?? task.slice(0, 80);
   let conversation: AppConversation = existingConversation ?? { id: randomUUID(), projectId: project.id, title,
     createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
@@ -221,7 +218,7 @@ async function runChatWorkflow(project: Project, task: string, workflowTask = ta
     }
   });
   try {
-    const result = await engine.run({ definition, profiles: Object.fromEntries(profiles.map((profile) => [profile.role, profile])) as GlobalRoleProfiles,
+    const result = await engine.run({ definition, profiles,
       projectId: project.id, projectRoot: project.root, task: workflowTask });
     if (result.run.summary !== undefined) persistence?.saveMessage({ id: randomUUID(), conversationId: conversation.id,
       role: "assistant", content: result.run.summary, createdAt: new Date().toISOString() });
@@ -240,7 +237,7 @@ async function runChatWorkflow(project: Project, task: string, workflowTask = ta
  * Without this a workflow dies three steps in — for instance when the review role still points at a provider whose
  * CLI has stopped accepting this client.
  */
-async function assertRolesUsable(profiles: readonly RoleExecutionProfile[]): Promise<void> {
+async function assertAgentsUsable(profiles: readonly AgentProfile[]): Promise<void> {
   const descriptors = new Map((await agentManager.discoverAll()).map((descriptor) => [descriptor.id, descriptor]));
   const broken = profiles.filter((profile) => profile.enabled)
     .map((profile) => ({ profile, descriptor: descriptors.get(profile.agentId) }))
@@ -249,9 +246,9 @@ async function assertRolesUsable(profiles: readonly RoleExecutionProfile[]): Pro
   const details = broken.map(({ profile, descriptor }) => {
     const reason = descriptor === undefined ? "provider is not registered"
       : !descriptor.installed ? "CLI is not installed" : descriptor.warnings[0] ?? "provider is unavailable";
-    return `${profile.role} → ${profile.agentId} (${reason})`;
+    return `${profile.name} → ${profile.agentId} (${reason})`;
   });
-  throw new Error(`Change these roles in Settings before running: ${details.join("; ")}`);
+  throw new Error(`Change these agents in Settings before running: ${details.join("; ")}`);
 }
 
 /** Best-effort provider default, used only for display; a probe failure must never fail the run. */
@@ -452,12 +449,12 @@ function registerIpc(): void {
     persistence?.saveConversation(conversation);
     persistence?.saveMessage({ id: randomUUID(), conversationId: conversation.id, role: "user", content: request.text, createdAt: now });
     let resolvedAgentId = request.agentId;
-    let routing: SessionSendResult["routing"];
     if (request.agentId === "auto") {
       resolvedAgentId = "fake";
-      routing = { routerAgentId: "opencode-router", role: "medium", decision: { complexity: "medium",
-        taskType: "feature", mode: "execute", effort: "medium", confidence: 0.92,
-        rationale: "The task spans several tested components." } };
+      const workflowRunId = randomUUID();
+      const desktopEvent = { type: "workflow.route.selected" as const, agentProfileId: "coder", agentName: "Coder",
+        workflowRunId, projectId: project.id, conversationId: conversation.id };
+      for (const window of BrowserWindow.getAllWindows()) window.webContents.send(IPC_CHANNELS.workflowsEvent, desktopEvent);
     }
     const previousSession = persistence?.listProviderSessions(conversation.id)
       .find((candidate) => candidate.agentId === resolvedAgentId && candidate.providerSessionId !== undefined);
@@ -482,8 +479,7 @@ function registerIpc(): void {
     const resolvedModel = model ?? await defaultModelId(resolvedAgentId);
     return { conversation, session, resolvedAgentId,
       ...(resolvedModel === undefined ? {} : { resolvedModel }),
-      ...(effort === undefined ? {} : { resolvedEffort: effort }),
-      ...(routing === undefined ? {} : { routing }) } satisfies SessionSendResult;
+      ...(effort === undefined ? {} : { resolvedEffort: effort }) } satisfies SessionSendResult;
   });
   ipcMain.handle(IPC_CHANNELS.sessionsCancel, async (event, input: unknown) => {
     assertTrustedIpc(event);
@@ -503,100 +499,22 @@ function registerIpc(): void {
     const response = questionResponseInputSchema.parse(input);
     await agentManager.respondToQuestion(response.sessionId, response.questionId, response.answers);
   });
-  ipcMain.handle(IPC_CHANNELS.routerPreview, async (event, input: unknown) => {
-    assertTrustedIpc(event);
-    const request = routerPreviewInputSchema.parse(input);
-    if (process.env.WAING_E2E === "1") return { status: "resolved" as const, resolution: {
-      routingDecision: { complexity: "medium" as const, taskType: "feature" as const, mode: "execute" as const,
-        effort: "medium" as const, confidence: 0.92, rationale: "The task spans several tested components." },
-      role: "medium" as const, matchedRuleId: "medium",
-    } };
-    const project = projects.get(request.projectId);
-    if (project === undefined) throw new Error("Choose a project before routing a task");
-    // Preview must route through the same provider the real run would use, or it previews the wrong router.
-    const client = createRouterClient((await resolveRoleProfiles()).profiles.find((profile) => profile.role === "router"), project);
-    try {
-      const selector = new AutoSelector(new RouterManager(client, ROUTER_TIMEOUT_MS));
-      const result = await selector.select({ type: "auto" }, { task: request.task }, {
-        defaultRole: "medium", rules: [
-          { id: "planning", enabled: true, match: { taskType: "planning" }, targetRole: "planning", priority: 110 },
-          { id: "documentation", enabled: true, match: { taskType: "documentation" }, targetRole: "document", priority: 100 },
-          { id: "review", enabled: true, match: { taskType: "review" }, targetRole: "review", priority: 100 },
-          { id: "bugfix", enabled: true, match: { taskType: "bugfix" }, targetRole: "bugfix", priority: 100 },
-          { id: "low", enabled: true, match: { complexity: "low" }, targetRole: "low", priority: 10 },
-          { id: "medium", enabled: true, match: { complexity: "medium" }, targetRole: "medium", priority: 10 },
-          { id: "high", enabled: true, match: { complexity: "high" }, targetRole: "high", priority: 10 },
-        ],
-      });
-      if (result.type !== "routed") throw new Error("Auto routing was unexpectedly bypassed");
-      return result.selection;
-    } finally {
-      await client.shutdown();
-      for (const sessionId of routerSessionIds) routerSessionIds.delete(sessionId);
-    }
-  });
-  ipcMain.handle(IPC_CHANNELS.workflowsRun, async (event, input: unknown) => {
-    assertTrustedIpc(event);
-    const request = workflowRunInputSchema.parse(input);
-    const project = projects.get(request.projectId);
-    if (project === undefined) throw new Error("Choose a project before running a workflow");
-    if (process.env.WAING_E2E === "1") {
-      const workflowRunId = randomUUID(); const stepRunId = randomUUID();
-      for (const event of [
-        { type: "workflow.started" as const, workflowRunId },
-        { type: "workflow.step.announced" as const, announcement: { workflowRunId, stepRunId, nodeId: "medium",
-          role: "medium" as const, agentId: "codex", agentDisplayName: "Codex", activity: "implementing" as const,
-          message: "Codex is implementing the task.", createdAt: new Date().toISOString() } },
-        { type: "workflow.node.started" as const, nodeId: "medium", stepRunId },
-        { type: "workflow.node.completed" as const, nodeId: "medium", stepRunId },
-        { type: "workflow.completed" as const, workflowRunId },
-      ]) for (const window of BrowserWindow.getAllWindows()) window.webContents.send(IPC_CHANNELS.workflowsEvent, event);
-      return { runId: workflowRunId, status: "completed", summary: "1 workflow step completed; 0 artifacts produced.",
-        steps: [{ nodeId: "medium", role: "medium", summary: "Task completed" }], loopState: {} };
-    }
-    const definition = new WorkflowCompiler().compilePreset(request.preset);
-    const profiles = Object.fromEntries(request.profiles.map((profile) => [profile.role, profile])) as GlobalRoleProfiles;
-    const routerClient = new OpenCodeRouterClient({ projectRoot: project.root });
-    try {
-      const repository = workflowRepository ?? new InMemoryWorkflowRepository();
-      await repository.saveDefinition(definition);
-      for (const profile of request.profiles) persistence?.saveRoleProfile("global", "default", profile);
-      const engine = new WorkflowEngine(repository, new AgentStepExecutor(agentManager), new RouterManager(routerClient));
-      const unsubscribe = engine.events.subscribe((event) => {
-        if (event.type === "workflow.started") {
-          const now = new Date().toISOString();
-          persistence?.saveConversation({ id: event.workflowRunId, projectId: project.id, title: request.task.slice(0, 80),
-            createdAt: now, updatedAt: now });
-          persistence?.saveMessage({ id: randomUUID(), conversationId: event.workflowRunId, role: "user",
-            content: request.task, createdAt: now });
-        }
-        for (const window of BrowserWindow.getAllWindows()) window.webContents.send(IPC_CHANNELS.workflowsEvent, event);
-      });
-      try {
-        const result = await engine.run({ definition, profiles, projectId: project.id, projectRoot: project.root, task: request.task });
-        if (result.run.summary !== undefined) persistence?.saveMessage({ id: randomUUID(), conversationId: result.run.id,
-          role: "assistant", content: result.run.summary, createdAt: new Date().toISOString() });
-        return { runId: result.run.id, status: result.run.status, ...(result.run.summary === undefined ? {} : { summary: result.run.summary }),
-          steps: result.context.stepResults.map((step) => ({ nodeId: step.nodeId, role: step.role, summary: step.summary })),
-          loopState: result.context.loopState };
-      } finally { unsubscribe(); }
-    } finally { await routerClient.shutdown(); }
-  });
-  ipcMain.handle(IPC_CHANNELS.settingsRolesGet, async (event, input: unknown) => {
+  ipcMain.handle(IPC_CHANNELS.settingsAgentsGet, async (event, input: unknown) => {
     assertTrustedIpc(event);
     emptyInputSchema.parse(input);
-    return resolveRoleProfiles();
+    return resolveAgentProfiles();
   });
-  ipcMain.handle(IPC_CHANNELS.settingsRolesSave, (event, input: unknown): RoleProfilesView => {
+  ipcMain.handle(IPC_CHANNELS.settingsAgentsSave, (event, input: unknown): AgentSettingsView => {
     assertTrustedIpc(event);
-    const { profiles } = roleProfilesInputSchema.parse(input);
-    const roles = new Set(profiles.map((profile) => profile.role));
-    if (roles.size !== ROLE_ORDER.length) throw new Error("Every workflow role needs exactly one profile");
-    for (const profile of profiles) persistence?.saveRoleProfile("global", "default", profile);
+    const { profiles, router } = agentSettingsInputSchema.parse(input);
+    const previous = persistence?.listAgentProfiles() ?? [];
+    for (const profile of previous) if (!profiles.some((candidate) => candidate.id === profile.id)) persistence?.removeAgentProfile(profile.id);
+    for (const profile of profiles) persistence?.saveAgentProfile(profile);
+    persistence?.setSetting("router.settings", router);
     persistence?.setSetting(ROUTING_CONFIGURED_SETTING, true);
-    return { profiles: sortRoleProfiles(profiles), needsReview: false };
+    return { profiles: sortAgentProfiles(profiles), router, needsReview: false };
   });
-  ipcMain.handle(IPC_CHANNELS.settingsRolesAcknowledge, (event, input: unknown) => {
+  ipcMain.handle(IPC_CHANNELS.settingsAgentsAcknowledge, (event, input: unknown) => {
     assertTrustedIpc(event);
     emptyInputSchema.parse(input);
     persistence?.setSetting(ROUTING_ACKNOWLEDGED_SETTING, true);

@@ -100,7 +100,8 @@ describe("OpenCodeAdapter", () => {
       id: "tool-1", sessionID: "ses-1", messageID: "msg-1", type: "tool", tool: "bash",
       state: { status: "completed", output: "passed" },
     } } });
-    api.stream.push({ type: "session.diff", properties: { sessionID: "ses-1", diff: [{ file: "src/a.ts" }] } });
+    api.stream.push({ type: "session.diff", properties: { sessionID: "ses-1", diff: [{ file: "src/a.ts",
+      before: "const value = 1;\n", after: "const value = 2;\n", additions: 1, deletions: 1 }] } });
     api.stream.push({ type: "message.part.updated", properties: { part: {
       id: "step-1", sessionID: "ses-1", messageID: "msg-1", type: "step-finish", tokens: { input: 20, output: 5 },
     } } });
@@ -109,6 +110,9 @@ describe("OpenCodeAdapter", () => {
     expect(afterPermission.map((event) => event.type)).toEqual([
       "permission.resolved", "tool.completed", "diff.updated", "usage.updated", "run.completed",
     ]);
+    const diffEvent = afterPermission.find((event) => event.type === "diff.updated");
+    expect(diffEvent?.type).toBe("diff.updated");
+    if (diffEvent?.type === "diff.updated") expect(diffEvent.diff).toContain("diff --git a/src/a.ts b/src/a.ts");
     expect([...beforePermission, ...afterPermission].map((event) => event.sequence)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
     expect(api.prompts).toHaveLength(1);
     await adapter.shutdown();

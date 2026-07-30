@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, Clock, CornerDownLeft, FileText, Folder, FolderOpen, Image, MoreHorizontal, PanelLeft, PanelRight,
   Paperclip, Plus, Settings, SquarePen, Trash2, X } from "lucide-react";
-import type { AppInfo, AttachmentChoice, ConversationHistory, SessionSendResult } from "@waing/ipc-contracts";
+import type { AppInfo, AttachmentChoice, ConversationHistory } from "@waing/ipc-contracts";
 import type { AgentDescriptor, AgentEvent, AgentQuestion, AgentQuestionResponse, AppConversation, PermissionRequest,
   Project, StepAnnouncement, WorkflowSharedState } from "@waing/domain";
 import { ActivityTimeline } from "./ActivityTimeline";
 import type { TimelineStep } from "./ActivityTimeline";
+import { DiffViewer } from "./DiffViewer";
 import { FileMentionList, useFileMentions } from "./FileMentions";
 import { QuestionCard } from "./QuestionCard";
 import { SettingsPanel } from "./SettingsPanel";
@@ -69,7 +70,6 @@ export function App() {
   const [resolvedModel, setResolvedModel] = useState<string>();
   const [resolvedEffort, setResolvedEffort] = useState<string>();
   const [routerStep, setRouterStep] = useState<"idle" | "running" | "failed">("idle");
-  const [routedBy, setRoutedBy] = useState<SessionSendResult["routing"]>();
   const [workflowSteps, setWorkflowSteps] = useState<TimelineStep[]>([]);
   const [agentMeta, setAgentMeta] = useState<Record<string, string>>({});
   const [activeStep, setActiveStep] = useState<StepAnnouncement>();
@@ -115,7 +115,7 @@ export function App() {
       setConversationsByProject(Object.fromEntries(entries));
       setConversations(entries[0]?.[1] ?? []);
     }).catch(reportError);
-    void window.waing.settings.roles().then((view) => setRoutingNeedsReview(view.needsReview)).catch(reportError);
+    void window.waing.settings.agents().then((view) => setRoutingNeedsReview(view.needsReview)).catch(reportError);
     const unsubscribeSession = window.waing.sessions.onEvent((event) => {
       if (event.workflowRunId !== undefined) {
         const eventProjectId = workflowProjectRef.current.get(event.workflowRunId);
@@ -185,28 +185,24 @@ export function App() {
           detail: "Deciding the next step…", state: "pending" }]);
       }
       if (event.type === "workflow.router.decided") {
-        const { decision, resolvedRole, resolvedAgentId: nextAgentId, resolvedModelId } = event.record;
+        const { decision, agentName, resolvedAgentId: nextAgentId, resolvedModelId } = event.record;
         setWorkflowSteps((current) => replaceLast(current, "pending", { id: `router-${String(current.length)}`,
           title: decision.action === "complete" ? "Router: done" : `Router: ${decision.action.replaceAll("_", " ")}`, state: "done",
-          detail: [resolvedRole, nextAgentId, resolvedModelId, `${String(Math.round(decision.confidence * 100))}%`]
+          detail: [agentName, nextAgentId, resolvedModelId, `${String(Math.round(decision.confidence * 100))}%`]
             .filter((part) => part !== undefined).join(" · ") }));
       }
       if (event.type === "workflow.step.announced") {
         const { announcement } = event; setActiveStep(announcement);
-        if (announcement.role !== "router") {
-          setAgentMeta((current) => ({ ...current, [announcement.agentId]:
+        setAgentMeta((current) => ({ ...current, [announcement.agentId]:
             `Model: ${announcement.modelDisplayName ?? announcement.modelId ?? "Provider default"} · Effort: ${announcement.effort ?? "Provider default"}` }));
           setWorkflowSteps((current) => [...current, { id: announcement.stepRunId, title: announcement.message,
             detail: [announcement.agentDisplayName, announcement.modelDisplayName ?? announcement.modelId, announcement.effort]
               .filter((part) => part !== undefined).join(" · "), state: "pending" }]);
-        }
       }
+      if (event.type === "workflow.route.selected") setWorkflowSteps((current) => [...current,
+        { id: `routed-${String(current.length)}`, title: `Routed to ${event.agentName}`, state: "done" }]);
       if (event.type === "workflow.node.completed") {
         setWorkflowSteps((current) => current.map((step) => step.id === event.stepRunId ? { ...step, state: "done" } : step));
-      }
-      if (event.type === "workflow.review.completed") {
-        setWorkflowSteps((current) => [...current, { id: `review-${String(current.length)}`,
-          title: `Review ${event.verdict === "pass" ? "passed" : "found issues"}`, state: event.verdict === "pass" ? "done" : "failed" }]);
       }
       if (event.type === "workflow.paused") {
         setWorkflowSteps((current) => [...current, { id: `paused-${String(current.length)}`, title: "Paused", detail: event.reason, state: "failed" }]);
@@ -280,14 +276,8 @@ export function App() {
   const busyAgentId = sendBusy ? activeStep?.agentId ?? resolvedAgentId : undefined;
 
   const steps: TimelineStep[] = [...workflowSteps];
-  if (routerStep === "running" && workflowSteps.length === 0) steps.push({ id: "router", title: "Routing", detail: "Choosing the role for this task…", state: "pending" });
+  if (routerStep === "running" && workflowSteps.length === 0) steps.push({ id: "router", title: "Routing", detail: "Choosing an agent for this task…", state: "pending" });
   if (routerStep === "failed") steps.push({ id: "router-failed", title: "Routing failed", state: "failed" });
-  if (routedBy !== undefined) {
-    steps.push({ id: "routed", title: `Routed to ${routedBy.role}`, state: "done",
-      detail: `${routedBy.routerModelId ?? routedBy.routerAgentId} · ${routedBy.decision.complexity} ${routedBy.decision.taskType} · ${String(Math.round(routedBy.decision.confidence * 100))}%` });
-    if (resolvedAgentId !== undefined) steps.push({ id: "picked", title: "Agent", state: "done",
-      detail: [selectedAgent?.displayName ?? resolvedAgentId, modelLabel, effortLabel].filter((part) => part !== undefined).join(" · ") });
-  }
 
   function reportError(reason: unknown): void {
     setError(reason instanceof Error ? reason.message : "An unexpected error occurred");
@@ -401,7 +391,7 @@ export function App() {
 
   function clearTranscript(): void {
     setEvents([]); setPrompt(undefined); setWorkflowSteps([]); setAgentMeta({}); setActiveStep(undefined);
-    setRoutedBy(undefined); setPermission(undefined); setQuestion(undefined); setResolvedAgentId(undefined);
+    setPermission(undefined); setQuestion(undefined); setResolvedAgentId(undefined);
     setResolvedModel(undefined); setResolvedEffort(undefined); setActiveSessionId(undefined); setOpenConversationId(undefined);
     setHistoryMessages([]);
   }
@@ -419,8 +409,7 @@ export function App() {
       const replay = history.events.filter((event) => event.type !== "permission.requested"
         && event.type !== "message.delta" && event.type !== "message.completed");
       setEvents(replay);
-      setAgentMeta(Object.fromEntries(history.announcements.filter((announcement) => announcement.role !== "router")
-        .map((announcement) => [announcement.agentId,
+      setAgentMeta(Object.fromEntries(history.announcements.map((announcement) => [announcement.agentId,
           `Model: ${announcement.modelDisplayName ?? announcement.modelId ?? "Provider default"} · Effort: ${announcement.effort ?? "Provider default"}`])));
       setReplayText(undefined); setPrompt(undefined);
       followRef.current = true;
@@ -467,7 +456,7 @@ export function App() {
     setRunningProjectIds((current) => new Set(current).add(target.id));
     pendingTaskTitleRef.current.set(target.id,
       conversations.find((conversation) => conversation.id === continuingConversationId)?.title ?? text.slice(0, 80));
-    setPrompt(text); setRoutedBy(undefined); setResolvedAgentId(undefined);
+    setPrompt(text); setResolvedAgentId(undefined);
     setResolvedModel(undefined); setResolvedEffort(undefined);
     setWorkflowSteps([]); setAgentMeta({}); setActiveStep(undefined); setActiveSessionId(undefined);
     // Routing happens inside the send call, so the step is shown as running until the reply names the routed role.
@@ -480,7 +469,7 @@ export function App() {
       if (result.session !== undefined) setActiveSessionId(result.session.id);
       setResolvedAgentId(result.resolvedAgentId);
       setResolvedModel(result.resolvedModel); setResolvedEffort(result.resolvedEffort);
-      setRoutedBy(result.routing); setRouterStep("idle");
+      setRouterStep("idle");
       setOpenConversationId(result.conversation.id);
       // A workflow reports its own terminal event; a single agent run is already finished when send resolves.
       if (result.workflowRunId === undefined) {
@@ -629,7 +618,7 @@ export function App() {
           </button>}
         </header>
         {routingNeedsReview && <div className="routing-banner" role="status">
-          <span>Auto routing is using defaults built from your installed providers.</span>
+          <span>Waing is using starter agents built from your installed providers.</span>
           <button type="button" onClick={() => { setView("settings"); }}>Review setup</button>
           <button className="dismiss" type="button" aria-label="Dismiss routing setup notice"
             onClick={() => { setRoutingNeedsReview(false); void window.waing.settings.acknowledgeRouting().catch(reportError); }}><X size={15} /></button>
@@ -710,7 +699,7 @@ export function App() {
           <div><dt>Provider</dt><dd>{providerLabel}</dd></div>
           <div><dt>Model</dt><dd>{modelLabel ?? "Provider default"}</dd></div>
           <div><dt>Effort</dt><dd>{effortLabel ?? "—"}</dd></div>
-          {(activeStep?.role ?? routedBy?.role) !== undefined && <div><dt>Role</dt><dd>{activeStep?.role ?? routedBy?.role}</dd></div>}
+          {activeStep?.agentName !== undefined && <div><dt>Agent</dt><dd>{activeStep.agentName}</dd></div>}
           {usage.input + usage.output > 0 && <div><dt>Tokens</dt>
             <dd title={`${usage.input.toLocaleString()} in · ${usage.output.toLocaleString()} out`}>
               {compactTokens(usage.input)} in · {compactTokens(usage.output)} out</dd></div>}</dl></section>
@@ -736,9 +725,7 @@ export function App() {
             <span className={`provider-dot ${state}`} aria-label={PROVIDER_DOT_TITLES[state]} role="img" />
             <strong>{agent.displayName}</strong></div>;
         })}</div></section>
-        <section className="diff-view"><p className="eyebrow">Latest diff{latestDiff?.type === "diff.updated" &&
-          ` · ${String(latestDiff.diff.split("\n").length)} lines`}</p>
-          {latestDiff?.type === "diff.updated" ? <pre>{latestDiff.diff}</pre> : <p>No file changes yet.</p>}</section>
+        <DiffViewer diff={latestDiff?.type === "diff.updated" ? latestDiff.diff : undefined} />
       </aside>}
     </main>
   );

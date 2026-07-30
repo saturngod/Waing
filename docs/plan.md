@@ -1552,107 +1552,36 @@ The workflow engine owns **orchestration**. Provider adapters own **communicatio
 
 A provider adapter must never decide which workflow step runs next.
 
-## 19.1 Required workflow roles
+## 19.1 User-created agents
 
-Waing must ship with these built-in logical roles:
+The router is the only fixed workflow component. Executable jobs are global user-created agent profiles. The router
+receives only each profile's id, name, and short `whereToUse` description, then delegates the next step by profile id.
+Five starter profiles—Planner, Coder, Architect, Reviewer, and Doc Writer—are seeded on an empty database and may be
+edited or removed.
 
-```ts
-export type WorkflowRole =
-  | "router"
-  | "planning"
-  | "low"
-  | "medium"
-  | "high"
-  | "review"
-  | "bugfix"
-  | "document";
-```
+## 19.2 Agent execution profile
 
-User-facing names:
-
-| Role | UI label | Purpose |
-|---|---|---|
-| `router` | Router | Classify the incoming task and choose the configured route |
-| `planning` | Planning | Analyze the request and produce a plan without implementing changes |
-| `low` | Low Level Task | Small, narrow, low-risk execution |
-| `medium` | Medium Level Task | Moderate multi-file work or investigation |
-| `high` | High Level Task | Complex/high-risk implementation or architecture work |
-| `review` | Review Level Task | Review current work and return a structured pass/fail result |
-| `bugfix` | Bug Fixing Task | Fix issues found by the user, tests, or a review step |
-| `document` | Document Task | Create or update PRD, docs, changelog, architecture notes, etc. |
-
-These are **logical workflow roles**, not hardcoded providers.
-
-The user can assign any supported agent to each role.
-
-## 19.2 Per-role execution profile
-
-Every role must be independently configurable.
+Every agent is independently configurable.
 
 ```ts
-export interface RoleExecutionProfile {
-  role: WorkflowRole;
+export interface AgentProfile {
+  id: string;
+  name: string;
+  whereToUse: string;
+  instructions?: string;
   enabled: boolean;
-
-  agentId: "codex" | "claude" | "gemini" | "opencode" | string;
+  agentId: string;
   modelId?: string;
   effort?: "low" | "medium" | "high" | "max";
-  mode?: "execute" | "plan" | "review" | "investigate";
   permissionProfileId?: string;
-
   timeoutMs?: number;
   maxRetries?: number;
-
-  // Optional role-level prompt added before the workflow step prompt.
-  instructions?: string;
+  position: number;
 }
 ```
 
-Example configuration:
-
-```json
-{
-  "router": {
-    "agentId": "opencode",
-    "modelId": "big-pickle",
-    "effort": "low",
-    "mode": "execute"
-  },
-  "low": {
-    "agentId": "codex",
-    "modelId": "gpt-5.6-codex",
-    "effort": "low"
-  },
-  "medium": {
-    "agentId": "codex",
-    "modelId": "gpt-5.6-codex",
-    "effort": "medium"
-  },
-  "high": {
-    "agentId": "claude",
-    "modelId": "opus",
-    "effort": "high"
-  },
-  "review": {
-    "agentId": "gemini",
-    "modelId": "gemini-pro",
-    "effort": "high",
-    "mode": "review"
-  },
-  "bugfix": {
-    "agentId": "codex",
-    "modelId": "gpt-5.6-codex",
-    "effort": "high"
-  },
-  "document": {
-    "agentId": "opencode",
-    "modelId": "configured-writing-model",
-    "effort": "medium"
-  }
-}
-```
-
-Model IDs in examples are illustrative configuration values. Waing must populate actual selectable models from each integration's current capabilities rather than hardcoding example names.
+Router provider/model settings are stored separately under `router.settings`. The workflow compiler builds a route
+for every enabled profile at run time, so adding an agent requires no code change.
 
 ## 19.3 User can choose agent, model, and effort at every step
 
@@ -3599,56 +3528,21 @@ Path: /...
 Status: Ready
 ```
 
-## Router
+## Agent roster and router
 
-- enabled
-- agent/provider
-- model
-- effort
-- timeout
-- low confidence policy
+- router model picker
+- create, edit, reorder, enable, and delete agents
+- name and short routing description
+- longer per-agent instructions
+- provider selector followed by a provider-scoped model selector
+- model-derived effort options
+- permission profile
+- validation requiring at least one enabled agent and unique ids
 
-## Workflow role profiles
+## Workflow
 
-Every role exposes Agent, Model, Effort, Mode, and Permission Profile. Changing Agent refreshes the Model list; changing Model refreshes valid Effort/Mode values. Unsupported combinations must be rejected before Save/Run.
-
-```text
-Router              → OpenCode / Big Pickle / Low
-Low Level Task      → Codex    / Model A    / Low
-Medium Level Task   → Codex    / Model A    / Medium
-High Level Task     → Claude   / Model B    / High
-Review Level Task   → Gemini   / Model C    / High
-Bug Fixing Task     → Codex    / Model A    / High
-Document Task       → OpenCode / Model D    / Medium
-```
-
-## Workflows
-
-- workflow preset picker
-- create workflow
-- clone workflow
-- version workflow
-- role step configuration
-- per-step agent/model/effort override
-- conditional routing
-- review/fix loop
-- loop max iterations
-- loop exhaustion behavior
-- create/update document steps
-- workflow validation
-
-Built-in presets:
-
-```text
-Standard
-Review Loop
-Review + Documentation
-PRD Driven
-```
-
-## Routing rules
-
-Routing rules resolve classification into workflow roles. Provider selection comes from the resolved role profile.
+The adaptive workflow is compiled from the enabled roster for every message. The router delegates by agent profile
+id, asks the user, or completes. There are no fixed complexity tiers or separate routing-rule editor.
 
 ## Permissions
 

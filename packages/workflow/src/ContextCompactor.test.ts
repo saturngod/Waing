@@ -3,9 +3,9 @@ import type { WorkflowStepResult } from "@waing/domain";
 import { compactHistory, DEFAULT_COMPACTION_BUDGET, latestTestPerCommand, renderPacket, withoutDiff } from "./ContextCompactor";
 
 function step(index: number, overrides: Partial<WorkflowStepResult> = {}): WorkflowStepResult {
-  return { stepRunId: `step-${String(index)}`, nodeId: `node-${String(index)}`, role: "medium", agentId: "fake",
+  return { stepRunId: `step-${String(index)}`, nodeId: `node-${String(index)}`, agentProfileId: "coder", agentName: "Coder", agentId: "fake",
     status: "completed", summary: `Headline ${String(index)}\n${"detail ".repeat(500)}`, filesRead: [],
-    filesChanged: [`src/file-${String(index)}.ts`], commandsRun: [], testsRun: [], artifacts: [], ...overrides };
+    filesChanged: [`src/file-${String(index)}.ts`], commandsRun: [], testsRun: [], ...overrides };
 }
 
 describe("ContextCompactor", () => {
@@ -55,7 +55,7 @@ describe("ContextCompactor", () => {
 
   it("renders packets as headed text that costs less than the equivalent JSON", () => {
     const packet = { originalTask: "build", currentGoal: "Review", changedFiles: ["a.ts", "b.ts"],
-      priorStepSummaries: [{ role: "medium", summary: "done", filesChanged: [], testsRun: [] }], unresolvedIssues: [] };
+      priorStepSummaries: [{ agentProfileId: "coder", agentName: "Coder", summary: "done", filesChanged: [], testsRun: [] }], unresolvedIssues: [] };
     const rendered = renderPacket("Handoff", packet);
     expect(rendered).toContain("originalTask: build");
     expect(rendered).toContain("- a.ts");

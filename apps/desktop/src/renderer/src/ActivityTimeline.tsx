@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import { Check, ChevronDown, Dot, X } from "lucide-react";
 import type { AgentEvent } from "@waing/domain";
 import { Markdown } from "./Markdown";
@@ -33,6 +34,15 @@ const SUPPRESSED: ReadonlySet<AgentEvent["type"]> = new Set(["usage.updated", "d
 // fence with it and left the opening one behind, which renders as an empty code block at the end of the message.
 const STATE_BLOCK = /```waing-state[\s\S]*?```|```waing-state[\s\S]*$|(?:```[\w-]*[^\S\r\n]*\r?\n\s*)?\{\s*"(?:planItems|decisions|openQuestions)"[\s\S]*$/gu;
 export function withoutStateBlock(text: string): string { return text.replace(STATE_BLOCK, "").trim(); }
+
+/** Compact, stable elapsed time for the transcript status (1s, 1m, 12m, 2h). */
+export function formatProcessDuration(milliseconds: number): string {
+  const seconds = Math.max(1, Math.floor(milliseconds / 1_000));
+  if (seconds < 60) return `${String(seconds)}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${String(minutes)}m`;
+  return `${String(Math.floor(minutes / 60))}h`;
+}
 
 function activityText(event: AgentEvent): { title: string; detail?: string } {
   switch (event.type) {
@@ -95,7 +105,8 @@ function buildChat(events: AgentEvent[], prompt: string | undefined): ChatItem[]
   return items;
 }
 
-function activitySummary(item: Extract<ChatItem, { kind: "activity" }>): string {
+function activitySummary(item: Extract<ChatItem, { kind: "activity" }>, completedElapsed?: string): string {
+  if (completedElapsed !== undefined) return `Worked for ${completedElapsed}`;
   const events = item.entries.flatMap((entry) => entry.kind === "event" ? [entry.event] : []);
   const latestCommand = [...events].reverse().find((event) => event.type === "command.started");
   if (item.pending) return latestCommand?.type === "command.started" ? `Running ${latestCommand.command.join(" ")}` : "Working…";
@@ -124,10 +135,30 @@ export function ActivityTimeline({ events, prompt, steps = [], model, effort, ag
 }) {
   const items = buildChat(events, prompt);
   const fallbackLabel = `Model: ${model ?? "Provider default"} · Effort: ${effort ?? "Provider default"}`;
-  // Both signals come from events, never from whether send() has returned: a single-agent run keeps streaming
-  // long after its send call resolves, so the transcript is what knows the work is still going.
-  const working = items.some((item) => item.kind === "activity" && item.pending)
-    || steps.some((step) => step.state === "pending");
+  // A message can finish while the run continues into another tool call, so activity-group pending state is not a
+  // reliable run clock. The absence of a terminal event is; routing steps cover the brief pre-provider interval.
+  const currentRunId = events.at(-1)?.runId;
+  const runEvents = currentRunId === undefined ? [] : events.filter((event) => event.runId === currentRunId);
+  const terminalEvent = [...runEvents].reverse().find((event) => event.type === "run.completed" || event.type === "run.failed");
+  const working = terminalEvent === undefined && (runEvents.length > 0 || steps.some((step) => step.state === "pending"));
+  const provisionalStart = useRef<number | undefined>(undefined);
+  if (working && provisionalStart.current === undefined) provisionalStart.current = Date.now();
+  if (!working) provisionalStart.current = undefined;
+  const eventStartedAt = runEvents.find((event) => event.type === "run.started")?.timestamp ?? runEvents[0]?.timestamp;
+  const startedAt = eventStartedAt === undefined ? provisionalStart.current : Date.parse(eventStartedAt);
+  const finishedAt = terminalEvent === undefined ? undefined : Date.parse(terminalEvent.timestamp);
+  const [now, setNow] = useState(Date.now);
+
+  useEffect(() => {
+    if (!working) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => { setNow(Date.now()); }, 1_000);
+    return () => { window.clearInterval(timer); };
+  }, [working, currentRunId]);
+
+  const elapsed = startedAt === undefined ? undefined
+    : formatProcessDuration(Math.max(0, (finishedAt ?? now) - startedAt));
+  const finalActivityId = [...items].reverse().find((item) => item.kind === "activity")?.id;
 
   const renderItem = (item: ChatItem) => {
     if (item.kind === "user") return <article className="chat-turn user" key={item.id}><div className="bubble">{item.text}</div></article>;
@@ -144,8 +175,9 @@ export function ActivityTimeline({ events, prompt, steps = [], model, effort, ag
           : <Markdown text={text} {...(projectId === undefined ? {} : { projectId })} />}</div>
       </article>;
     }
+    const completedElapsed = !working && item.id === finalActivityId ? elapsed : undefined;
     return <details className={`activity-group ${item.pending ? "pending" : "done"}`} key={item.id}>
-      <summary><span className="activity-spinner" aria-hidden="true" /><span>{activitySummary(item)}</span><ChevronDown className="activity-chevron" size={16} /></summary>
+      <summary><span className="activity-spinner" aria-hidden="true" /><span>{activitySummary(item, completedElapsed)}</span><ChevronDown className="activity-chevron" size={16} /></summary>
       <div className="activity-group-items">{item.entries.map((entry) => {
         if (entry.kind === "output") return <pre className="activity-output" key={entry.id}>{entry.text}</pre>;
         const content = activityText(entry.event);
@@ -180,8 +212,9 @@ export function ActivityTimeline({ events, prompt, steps = [], model, effort, ag
     {replayText !== undefined && <article className="chat-turn agent"><div className="chat-author">summary</div>
       <div className="chat-text"><Markdown text={withoutStateBlock(replayText)} {...(projectId === undefined ? {} : { projectId })} /></div></article>}
     {items.filter((item) => item.kind !== "user").map(renderItem)}
-    {working && <div className="task-loading" role="status" aria-label="Agent is working">
-      <span className="task-loading-spinner" aria-hidden="true" /><span>Working</span>
+    {working && elapsed !== undefined && <div className="task-loading working" role="status" aria-label="Agent is working">
+      <span className="task-loading-spinner" aria-hidden="true" />
+      <span>Working {elapsed}</span>
     </div>}
   </section>;
 }

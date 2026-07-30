@@ -1,16 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Activity, ArrowLeft, Search, Server, Settings2, Workflow } from "lucide-react";
+import { Activity, ArrowLeft, Bot, Search, Server, Settings2 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import type { AgentDescriptor, RoleExecutionProfile } from "@waing/domain";
-import { RoleProfileGrid } from "./RoleProfileGrid";
+import type { AgentDescriptor, AgentProfile, RouterSettings } from "@waing/domain";
+import { AgentsSettings } from "./AgentsSettings";
 import { PROVIDER_STATUS_HINT, providerDotState, providerStatusLabel } from "./providerStatus";
 
-type SettingsSection = "general" | "routing" | "providers" | "diagnostics";
+type SettingsSection = "general" | "agents" | "providers" | "diagnostics";
 
 const SETTINGS_SECTIONS: Array<{ id: SettingsSection; label: string; icon: LucideIcon; keywords: string }> = [
   { id: "general", label: "General", icon: Settings2, keywords: "theme appearance updates" },
   // Permissions are set per role here, so a search for them lands on this page rather than a screen of its own.
-  { id: "routing", label: "Roles & routing", icon: Workflow, keywords: "agents models effort mode workflow auto permissions access approvals" },
+  { id: "agents", label: "Agents", icon: Bot, keywords: "agents router models effort workflow auto permissions instructions" },
   { id: "providers", label: "Providers", icon: Server, keywords: "codex claude opencode antigravity status health" },
   { id: "diagnostics", label: "Diagnostics", icon: Activity, keywords: "events logs export troubleshooting" },
 ];
@@ -23,7 +23,8 @@ export function SettingsPanel({ agents, eventCount, theme, onThemeChange, onRole
   const [section, setSection] = useState<SettingsSection>("general");
   const [search, setSearch] = useState("");
   const [exportedPath, setExportedPath] = useState<string>();
-  const [profiles, setProfiles] = useState<RoleExecutionProfile[]>([]);
+  const [profiles, setProfiles] = useState<AgentProfile[]>([]);
+  const [router, setRouter] = useState<RouterSettings>();
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveAttempt, setSaveAttempt] = useState(0);
@@ -36,31 +37,29 @@ export function SettingsPanel({ agents, eventCount, theme, onThemeChange, onRole
   }, [search]);
 
   useEffect(() => {
-    void window.waing.settings.roles().then((view) => setProfiles(view.profiles))
-      .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "Could not load role settings"));
+    void window.waing.settings.agents().then((view) => { setProfiles(view.profiles); setRouter(view.router); })
+      .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "Could not load agent settings"));
   }, []);
 
   useEffect(() => {
-    if (!dirty || profiles.length === 0) return;
+    if (!dirty || profiles.length === 0 || router === undefined) return;
     const revision = ++saveRevision.current;
     const timeout = window.setTimeout(() => {
       setSaving(true); setError(undefined);
-      void window.waing.settings.saveRoles(profiles).then((view) => {
+      void window.waing.settings.saveAgents(profiles, router).then((view) => {
         if (revision !== saveRevision.current) return;
-        setProfiles(view.profiles); setDirty(false); setSaving(false); onRolesSaved(view.needsReview);
+        setProfiles(view.profiles); setRouter(view.router); setDirty(false); setSaving(false); onRolesSaved(view.needsReview);
       }).catch((reason: unknown) => {
         if (revision !== saveRevision.current) return;
         setSaving(false);
-        setError(reason instanceof Error ? reason.message : "Could not save role settings");
+        setError(reason instanceof Error ? reason.message : "Could not save agent settings");
       });
     }, 400);
     return () => window.clearTimeout(timeout);
-  }, [dirty, onRolesSaved, profiles, saveAttempt]);
+  }, [dirty, onRolesSaved, profiles, router, saveAttempt]);
 
-  function update(index: number, patch: Partial<RoleExecutionProfile>): void {
-    setDirty(true); setError(undefined);
-    setProfiles((current) => current.map((profile, item) => item === index ? { ...profile, ...patch } : profile));
-  }
+  function updateProfiles(next: AgentProfile[]): void { setDirty(true); setError(undefined); setProfiles(next); }
+  function updateRouter(next: RouterSettings): void { setDirty(true); setError(undefined); setRouter(next); }
   async function exportDiagnostics(): Promise<void> {
     const path = await window.waing.diagnostics.export(); if (path !== null) setExportedPath(path);
   }
@@ -88,11 +87,12 @@ export function SettingsPanel({ agents, eventCount, theme, onThemeChange, onRole
             <select defaultValue="manual"><option>manual</option><option>notify</option></select></label>
         </div></div></>}
 
-      {section === "routing" && <><header className="wide"><p>Settings</p><h2>Roles & routing</h2>
-        <span>Choose which provider and model handles each kind of work.</span></header>
-        <div className="settings-section routing-settings"><div className="settings-section-heading"><h3>Role assignments</h3>
+      {section === "agents" && <><header className="wide"><p>Settings</p><h2>Agents</h2>
+        <span>Create the roster the router can delegate work to.</span></header>
+        <div className="settings-section routing-settings"><div className="settings-section-heading"><h3>Routing</h3>
           <span className="settings-save-status" role="status" aria-live="polite">{saving ? "Saving…" : ""}</span></div>
-          {profiles.length === 0 ? <p>Loading roles…</p> : <RoleProfileGrid profiles={profiles} agents={agents} onChange={update} />}
+          {profiles.length === 0 || router === undefined ? <p>Loading agents…</p> : <AgentsSettings profiles={profiles} router={router}
+            agents={agents} onProfilesChange={updateProfiles} onRouterChange={updateRouter} />}
           {error !== undefined && <div className="settings-save-error" role="alert"><p>{error}</p>
             {dirty && <button type="button" onClick={() => setSaveAttempt((attempt) => attempt + 1)}>Retry</button>}</div>}
         </div></>}

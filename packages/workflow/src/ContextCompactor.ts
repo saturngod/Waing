@@ -60,11 +60,11 @@ export function compactHistory(results: WorkflowStepResult[], budget: Compaction
   const protectedFrom = Math.max(0, kept.length - budget.tailSteps);
   const summaries = kept.map((result, index) => {
     if (index >= protectedFrom) {
-      return { role: result.role, summary: clip(result.summary, budget.summaryChars),
+      return { agentProfileId: result.agentProfileId, agentName: result.agentName, summary: clip(result.summary, budget.summaryChars),
         filesChanged: result.filesChanged, testsRun: result.testsRun };
     }
     // Collapsed steps surrender their file list to the packet-level `changedFiles` set rather than repeating it.
-    return { role: result.role, summary: headline(result.summary, budget.collapsedChars), filesChanged: [],
+    return { agentProfileId: result.agentProfileId, agentName: result.agentName, summary: headline(result.summary, budget.collapsedChars), filesChanged: [],
       testsRun: failingTests(result.testsRun), collapsed: true };
   });
   const changedFiles = [...new Set(considered.flatMap((result) => result.filesChanged))].slice(-budget.maxChangedFiles);

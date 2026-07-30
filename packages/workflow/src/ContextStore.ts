@@ -27,7 +27,7 @@ export class ContextStore {
   }
   async recordStep(context: WorkflowContext, result: WorkflowStepResult): Promise<void> {
     context.stepResults.push(result); context.completedNodeIds.push(result.nodeId);
-    context.artifacts.push(...result.artifacts); context.stateVersion += 1;
+    context.stateVersion += 1;
     if (result.stateUpdate !== undefined) context.sharedState = mergeSharedState(context.sharedState, result.stateUpdate);
     await this.repository.saveStepResult(context.workflowRunId, result); await this.repository.saveContext(context);
   }

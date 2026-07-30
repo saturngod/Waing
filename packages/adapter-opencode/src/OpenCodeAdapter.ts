@@ -8,6 +8,7 @@ import type {
 } from "@waing/domain";
 import { SdkOpenCodeApi } from "./OpenCodeApi";
 import type { OpenCodeApi } from "./OpenCodeApi";
+import { normalizeOpenCodeDiff } from "./OpenCodeDiff";
 import { OpenCodeServer } from "./OpenCodeServer";
 import type { OpenCodeServerHandle } from "./OpenCodeServer";
 
@@ -224,7 +225,10 @@ export class OpenCodeAdapter implements CodingAgent {
     }
     else if (event.type === "session.idle") this.complete(state);
     else if (event.type === "session.error") this.fail(state, "PROTOCOL_ERROR", this.errorMessage(properties.error));
-    else if (event.type === "session.diff") this.emitActive(state, { type: "diff.updated", diff: JSON.stringify(properties.diff ?? []) });
+    else if (event.type === "session.diff") {
+      const diff = normalizeOpenCodeDiff(properties.diff);
+      if (diff.length > 0) this.emitActive(state, { type: "diff.updated", diff });
+    }
   }
 
   private handlePart(state: SessionState, part: Record<string, unknown>, rawDelta: unknown): void {
@@ -239,7 +243,8 @@ export class OpenCodeAdapter implements CodingAgent {
     } else if (part.type === "reasoning" && typeof part.text === "string") {
       this.emit(state, runId, { type: "plan.updated", text: part.text });
     } else if (part.type === "tool") this.handleTool(state, runId, part);
-    else if (part.type === "patch") this.emit(state, runId, { type: "diff.updated", diff: JSON.stringify(part.files ?? []) });
+    // Patch parts only name touched files. The session.diff event carries the actual source/patch and is the one
+    // normalized above; emitting the filename array here would replace it with non-renderable protocol JSON.
     else if (part.type === "step-finish") {
       const tokens = part.tokens as { input?: unknown; output?: unknown } | undefined;
       this.emit(state, runId, { type: "usage.updated", inputTokens: this.number(tokens?.input), outputTokens: this.number(tokens?.output) });

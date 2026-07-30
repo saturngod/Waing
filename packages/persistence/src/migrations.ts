@@ -16,27 +16,17 @@ CREATE TABLE agent_events (id TEXT PRIMARY KEY, conversation_id TEXT, workflow_r
   payload_json TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE permission_decisions (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), session_id TEXT NOT NULL,
   request_id TEXT NOT NULL, decision TEXT NOT NULL, request_json TEXT NOT NULL, created_at TEXT NOT NULL);
-CREATE TABLE routing_decisions (id TEXT PRIMARY KEY, conversation_id TEXT, workflow_run_id TEXT, kind TEXT NOT NULL,
-  decision_json TEXT NOT NULL, created_at TEXT NOT NULL);
-CREATE TABLE routing_rules (id TEXT PRIMARY KEY, rule_json TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE workflow_definitions (id TEXT NOT NULL, version INTEGER NOT NULL, name TEXT NOT NULL, definition_json TEXT NOT NULL,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (id, version));
-CREATE TABLE workflow_role_profiles (scope TEXT NOT NULL, scope_id TEXT NOT NULL, role TEXT NOT NULL, profile_json TEXT NOT NULL,
-  updated_at TEXT NOT NULL, PRIMARY KEY (scope, scope_id, role));
+CREATE TABLE agent_profiles (id TEXT PRIMARY KEY, profile_json TEXT NOT NULL, position INTEGER NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE workflow_runs (id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, workflow_version INTEGER NOT NULL, status TEXT NOT NULL,
   summary TEXT, context_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE workflow_step_runs (step_run_id TEXT PRIMARY KEY, workflow_run_id TEXT NOT NULL REFERENCES workflow_runs(id), node_id TEXT NOT NULL,
-  role TEXT NOT NULL, status TEXT NOT NULL, result_json TEXT NOT NULL);
+  agent_profile_id TEXT NOT NULL, agent_name TEXT NOT NULL, status TEXT NOT NULL, result_json TEXT NOT NULL);
 CREATE TABLE workflow_edges_taken (id TEXT PRIMARY KEY, workflow_run_id TEXT NOT NULL REFERENCES workflow_runs(id), edge_id TEXT NOT NULL,
   from_node_id TEXT NOT NULL, to_node_id TEXT NOT NULL, created_at TEXT NOT NULL);
-CREATE TABLE workflow_artifacts (id TEXT PRIMARY KEY, workflow_run_id TEXT NOT NULL REFERENCES workflow_runs(id), kind TEXT NOT NULL,
-  path TEXT NOT NULL, artifact_json TEXT NOT NULL);
 CREATE TABLE workflow_loop_state (workflow_run_id TEXT NOT NULL REFERENCES workflow_runs(id), loop_id TEXT NOT NULL,
   iteration INTEGER NOT NULL, max_iterations INTEGER NOT NULL, PRIMARY KEY (workflow_run_id, loop_id));
-CREATE TABLE workflow_reviews (step_run_id TEXT PRIMARY KEY, workflow_run_id TEXT NOT NULL REFERENCES workflow_runs(id),
-  verdict TEXT NOT NULL, summary TEXT NOT NULL, review_json TEXT NOT NULL);
-CREATE TABLE workflow_findings (id TEXT PRIMARY KEY, workflow_run_id TEXT NOT NULL REFERENCES workflow_runs(id), step_run_id TEXT NOT NULL,
-  severity TEXT NOT NULL, finding_json TEXT NOT NULL);
 CREATE TABLE workflow_announcements (step_run_id TEXT PRIMARY KEY, workflow_run_id TEXT NOT NULL REFERENCES workflow_runs(id),
   announcement_json TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE settings (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -45,6 +35,38 @@ CREATE TABLE provider_health (provider_id TEXT PRIMARY KEY, payload_json TEXT NO
 CREATE INDEX idx_conversations_project ON conversations(project_id);
 CREATE INDEX idx_events_conversation ON agent_events(conversation_id, created_at);
 CREATE INDEX idx_steps_workflow_run ON workflow_step_runs(workflow_run_id);
-CREATE INDEX idx_routes_workflow_run ON routing_decisions(workflow_run_id, created_at);
+`,
+}, {
+  version: 2,
+  name: "replace_fixed_roles_with_agent_profiles",
+  destructive: true,
+  sql: `
+DROP TABLE IF EXISTS workflow_findings;
+DROP TABLE IF EXISTS workflow_reviews;
+DROP TABLE IF EXISTS workflow_artifacts;
+DROP TABLE IF EXISTS workflow_announcements;
+DROP TABLE IF EXISTS workflow_loop_state;
+DROP TABLE IF EXISTS workflow_edges_taken;
+DROP TABLE IF EXISTS workflow_step_runs;
+DROP TABLE IF EXISTS workflow_runs;
+DROP TABLE IF EXISTS workflow_definitions;
+DROP TABLE IF EXISTS workflow_role_profiles;
+DROP TABLE IF EXISTS routing_rules;
+DROP TABLE IF EXISTS routing_decisions;
+
+CREATE TABLE IF NOT EXISTS agent_profiles (id TEXT PRIMARY KEY, profile_json TEXT NOT NULL, position INTEGER NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE workflow_definitions (id TEXT NOT NULL, version INTEGER NOT NULL, name TEXT NOT NULL, definition_json TEXT NOT NULL,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (id, version));
+CREATE TABLE workflow_runs (id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, workflow_version INTEGER NOT NULL, status TEXT NOT NULL,
+  summary TEXT, context_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE workflow_step_runs (step_run_id TEXT PRIMARY KEY, workflow_run_id TEXT NOT NULL REFERENCES workflow_runs(id), node_id TEXT NOT NULL,
+  agent_profile_id TEXT NOT NULL, agent_name TEXT NOT NULL, status TEXT NOT NULL, result_json TEXT NOT NULL);
+CREATE TABLE workflow_edges_taken (id TEXT PRIMARY KEY, workflow_run_id TEXT NOT NULL REFERENCES workflow_runs(id), edge_id TEXT NOT NULL,
+  from_node_id TEXT NOT NULL, to_node_id TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE workflow_loop_state (workflow_run_id TEXT NOT NULL REFERENCES workflow_runs(id), loop_id TEXT NOT NULL,
+  iteration INTEGER NOT NULL, max_iterations INTEGER NOT NULL, PRIMARY KEY (workflow_run_id, loop_id));
+CREATE TABLE workflow_announcements (step_run_id TEXT PRIMARY KEY, workflow_run_id TEXT NOT NULL REFERENCES workflow_runs(id),
+  announcement_json TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE INDEX idx_steps_workflow_run ON workflow_step_runs(workflow_run_id);
 `,
 }];

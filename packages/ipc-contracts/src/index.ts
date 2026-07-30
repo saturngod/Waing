@@ -1,5 +1,5 @@
-import type { AgentDescriptor, AgentQuestionResponse, AgentEvent, AgentModelDescriptor, AgentSession, AppConversation, AutoSelection, EffortLevel, ExecutionWorkflowRole, PermissionDecision, Project, RoleExecutionProfile, RoutingDecision, StepAnnouncement, WorkflowEvent, WorkspaceFileMatches } from "@waing/domain";
-import { agentQuestionResponseSchema, roleExecutionProfileSchema } from "@waing/domain";
+import type { AgentDescriptor, AgentProfile, AgentQuestionResponse, AgentEvent, AgentModelDescriptor, AgentSession, AppConversation, EffortLevel, PermissionDecision, Project, RouterSettings, StepAnnouncement, WorkflowEvent, WorkspaceFileMatches } from "@waing/domain";
+import { agentProfileSchema, agentQuestionResponseSchema, routerSettingsSchema } from "@waing/domain";
 import { z } from "zod";
 
 export { IPC_CHANNELS } from "./channels";
@@ -13,7 +13,6 @@ export const permissionResponseInputSchema = z.object({
 export const questionResponseInputSchema = z.object({
   sessionId: z.string().min(1), questionId: z.string().min(1), answers: agentQuestionResponseSchema,
 });
-export const routerPreviewInputSchema = z.object({ task: z.string().min(1), projectId: z.string().min(1) });
 export const projectIdInputSchema = z.object({ projectId: z.string().min(1) });
 export const conversationIdInputSchema = z.object({ conversationId: z.string().min(1) });
 export const conversationRemoveInputSchema = z.object({ conversationId: z.string().min(1), projectId: z.string().min(1) });
@@ -46,16 +45,14 @@ export const sessionCancelInputSchema = z.object({ sessionId: z.string().min(1) 
 export interface SessionSendResult {
   conversation: AppConversation; session?: AgentSession; resolvedAgentId?: string;
   resolvedModel?: string; resolvedEffort?: EffortLevel; workflowRunId?: string; workflowStatus?: string;
-  routing?: { routerAgentId: string; routerModelId?: string; role: ExecutionWorkflowRole; decision: RoutingDecision };
 }
-export const workflowRunInputSchema = z.object({ task: z.string().min(1), projectId: z.string().min(1),
-  preset: z.enum(["standard", "review_loop", "review_documentation", "prd_driven"]),
-  profiles: z.array(roleExecutionProfileSchema).length(8) });
-export interface WorkflowRunView { runId: string; status: string; summary?: string; steps: Array<{ nodeId: string; role: string; summary: string }>; loopState: Record<string, { iteration: number; maxIterations: number }> }
-
-export const roleProfilesInputSchema = z.object({ profiles: z.array(roleExecutionProfileSchema).length(8) });
+export const agentSettingsInputSchema = z.object({ profiles: z.array(agentProfileSchema).min(1), router: routerSettingsSchema }).strict()
+  .superRefine((value, context) => {
+    if (!value.profiles.some((profile) => profile.enabled)) context.addIssue({ code: "custom", message: "At least one agent must be enabled" });
+    if (new Set(value.profiles.map((profile) => profile.id)).size !== value.profiles.length) context.addIssue({ code: "custom", message: "Agent ids must be unique" });
+  });
 /** `needsReview` is true while routing still runs on seeded defaults the user has neither saved nor dismissed. */
-export interface RoleProfilesView { profiles: RoleExecutionProfile[]; needsReview: boolean }
+export interface AgentSettingsView { profiles: AgentProfile[]; router: RouterSettings; needsReview: boolean }
 
 /** Main-process context added to every workflow event so concurrent runs can be isolated in the renderer. */
 export type DesktopWorkflowEvent = WorkflowEvent & { workflowRunId: string; projectId: string; conversationId: string };
@@ -116,14 +113,12 @@ export interface DesktopApi {
   questions: {
     respond(sessionId: string, questionId: string, answers: AgentQuestionResponse): Promise<void>;
   };
-  router: { preview(task: string, projectId: string): Promise<AutoSelection> };
   workflows: {
-    run(input: z.infer<typeof workflowRunInputSchema>): Promise<WorkflowRunView>;
     onEvent(callback: (event: DesktopWorkflowEvent) => void): () => void;
   };
   settings: {
-    roles(): Promise<RoleProfilesView>;
-    saveRoles(profiles: RoleExecutionProfile[]): Promise<RoleProfilesView>;
+    agents(): Promise<AgentSettingsView>;
+    saveAgents(profiles: AgentProfile[], router: RouterSettings): Promise<AgentSettingsView>;
     acknowledgeRouting(): Promise<void>;
   };
   diagnostics: { export(): Promise<string | null> };

@@ -1,5 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { withoutStateBlock } from "./ActivityTimeline";
+import { formatProcessDuration, withoutStateBlock } from "./ActivityTimeline";
+
+describe("process duration", () => {
+  it("shows a compact live and completed duration", () => {
+    expect(formatProcessDuration(0)).toBe("1s");
+    expect(formatProcessDuration(14_999)).toBe("14s");
+    expect(formatProcessDuration(60_000)).toBe("1m");
+    expect(formatProcessDuration(12 * 60_000 + 59_000)).toBe("12m");
+    expect(formatProcessDuration(2 * 60 * 60_000)).toBe("2h");
+  });
+});
 
 describe("shared-state block stripping", () => {
   it("removes the block whatever fence the provider wrapped it in", () => {

@@ -75,11 +75,11 @@ describe("AgentRouterClient", () => {
   });
 
   it("uses plan mode and the configured model when the provider supports them", async () => {
-    const agent = new RoutingAgent("codex", '{"action":"review"}', capabilities({ planMode: true, modelSelection: true }));
+    const agent = new RoutingAgent("codex", '{"action":"review"}', capabilities({ planMode: true, modelSelection: true, effortControl: true }));
     const client = new AgentRouterClient({ agents: manager(agent), agentId: "codex", projectId: "p",
-      projectRoot: "/tmp", model: "gpt-5-codex" });
+      projectRoot: "/tmp", model: "gpt-5-codex", effort: "high" });
     await expect(client.classify("classify")).resolves.toEqual({ action: "review" });
-    expect(agent.requests[0]).toMatchObject({ mode: "plan", model: "gpt-5-codex" });
+    expect(agent.requests[0]).toMatchObject({ mode: "plan", model: "gpt-5-codex", effort: "high" });
   });
 
   it("reports non-JSON answers as a retryable router error", async () => {

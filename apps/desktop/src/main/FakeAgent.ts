@@ -55,7 +55,14 @@ export class FakeAgent implements CodingAgent {
       { type: "run.failed", code: "PERMISSION_DENIED", message: "Permission denied", retryable: false });
     else {
       this.emit(sessionId, pending.runId, 4, { type: "message.completed", text: pending.text });
-      this.emit(sessionId, pending.runId, 5, { type: "run.completed", summary: "Fake run completed" });
+      this.emit(sessionId, pending.runId, 5, { type: "diff.updated", diff: [
+        "diff --git a/src/dashboard.ts b/src/dashboard.ts",
+        "--- a/src/dashboard.ts", "+++ b/src/dashboard.ts",
+        "@@ -10,3 +10,4 @@ export function dashboard() {",
+        "   const title = project.name;", "-  return oldDashboard(title);", "+  const view = searchableDashboard(title);",
+        "+  return view;", " }",
+      ].join("\n") });
+      this.emit(sessionId, pending.runId, 6, { type: "run.completed", summary: "Fake run completed" });
     }
     return Promise.resolve();
   }

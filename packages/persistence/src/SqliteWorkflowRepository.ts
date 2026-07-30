@@ -53,24 +53,13 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
   }
   saveStepResult(workflowRunId: string, result: WorkflowStepResult): Promise<void> {
     const value = workflowStepResultSchema.parse(result);
-    this.database.connection.prepare(`INSERT OR REPLACE INTO workflow_step_runs(step_run_id,workflow_run_id,node_id,role,status,result_json)
-      VALUES(?,?,?,?,?,?)`).run(value.stepRunId, workflowRunId, value.nodeId, value.role, value.status, JSON.stringify(value));
-    const artifactStatement = this.database.connection.prepare(`INSERT OR REPLACE INTO workflow_artifacts(id,workflow_run_id,kind,path,artifact_json)
-      VALUES(?,?,?,?,?)`);
-    for (const artifact of value.artifacts) artifactStatement.run(artifact.id, workflowRunId, artifact.kind, artifact.path, JSON.stringify(artifact));
-    if (value.reviewVerdict !== undefined) this.database.connection.prepare(`INSERT OR REPLACE INTO workflow_reviews(step_run_id,workflow_run_id,verdict,summary,review_json)
-      VALUES(?,?,?,?,?)`).run(value.stepRunId, workflowRunId, value.reviewVerdict, value.summary,
-      JSON.stringify({ verdict: value.reviewVerdict, findings: value.findings ?? [] }));
-    const findingStatement = this.database.connection.prepare(`INSERT OR REPLACE INTO workflow_findings(id,workflow_run_id,step_run_id,severity,finding_json)
-      VALUES(?,?,?,?,?)`);
-    for (const finding of value.findings ?? []) findingStatement.run(finding.id, workflowRunId, value.stepRunId,
-      finding.severity, JSON.stringify(finding));
+    this.database.connection.prepare(`INSERT OR REPLACE INTO workflow_step_runs(step_run_id,workflow_run_id,node_id,agent_profile_id,agent_name,status,result_json)
+      VALUES(?,?,?,?,?,?,?)`).run(value.stepRunId, workflowRunId, value.nodeId, value.agentProfileId, value.agentName, value.status, JSON.stringify(value));
     return Promise.resolve();
   }
   saveRouterDecision(record: RouterDecisionRecord): Promise<void> {
     const value = routerDecisionRecordSchema.parse(record);
-    this.database.connection.prepare(`INSERT OR REPLACE INTO routing_decisions(id,conversation_id,workflow_run_id,kind,decision_json,created_at)
-      VALUES(?,?,?,?,?,?)`).run(value.id, null, value.workflowRunId, "workflow", JSON.stringify(value), value.createdAt);
+    void value;
     return Promise.resolve();
   }
   saveAnnouncement(announcement: StepAnnouncement): Promise<void> {
@@ -95,14 +84,12 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
   loadHistory(workflowRunId: string): PersistedWorkflowHistory {
     const stepRows = this.database.connection.prepare("SELECT result_json FROM workflow_step_runs WHERE workflow_run_id=? ORDER BY rowid")
       .all(workflowRunId) as Array<{ result_json: string }>;
-    const routeRows = this.database.connection.prepare("SELECT decision_json FROM routing_decisions WHERE workflow_run_id=? ORDER BY created_at")
-      .all(workflowRunId) as Array<{ decision_json: string }>;
     const announcementRows = this.database.connection.prepare("SELECT announcement_json FROM workflow_announcements WHERE workflow_run_id=? ORDER BY created_at")
       .all(workflowRunId) as Array<{ announcement_json: string }>;
     const edges = this.database.connection.prepare(`SELECT edge_id AS edgeId,from_node_id AS "from",to_node_id AS "to"
       FROM workflow_edges_taken WHERE workflow_run_id=? ORDER BY created_at`).all(workflowRunId) as unknown as PersistedWorkflowHistory["edges"];
     return { steps: stepRows.map((row) => workflowStepResultSchema.parse(JSON.parse(row.result_json))),
-      routerDecisions: routeRows.map((row) => routerDecisionRecordSchema.parse(JSON.parse(row.decision_json))),
+      routerDecisions: [],
       announcements: announcementRows.map((row) => stepAnnouncementSchema.parse(JSON.parse(row.announcement_json))), edges };
   }
 }

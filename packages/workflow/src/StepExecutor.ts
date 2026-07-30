@@ -1,11 +1,10 @@
-import { randomUUID } from "node:crypto";
 import type { AgentManager } from "@waing/agent-core";
 import {
-  AgentError, resolvePermissionProfile, reviewResultSchema, workflowHandoffPacketSchema,
+  AgentError, resolvePermissionProfile, workflowHandoffPacketSchema,
   workflowSharedStateUpdateSchema, workflowStepResultSchema,
 } from "@waing/domain";
 import type {
-  AgentEvent, AgentRequest, AgentSession, DocumentTaskInput, FixPacket, RoleExecutionProfile, StepAnnouncementIntent, WorkflowContext,
+  AgentEvent, AgentProfile, AgentRequest, AgentSession, StepAnnouncementIntent, WorkflowContext,
   WorkflowHandoffPacket, WorkflowNode, WorkflowSharedStateUpdate, WorkflowStepResult,
 } from "@waing/domain";
 import { renderPacket } from "./ContextCompactor";
@@ -17,11 +16,9 @@ export interface ResolvedProfileDisplay { agentDisplayName: string; modelDisplay
 export interface StepExecutionInput {
   stepRunId: string;
   node: Exclude<WorkflowNode, { type: "router" | "loop" | "complete" }>;
-  profile: RoleExecutionProfile;
+  profile: AgentProfile;
   context: WorkflowContext;
   handoff: WorkflowHandoffPacket;
-  fixPacket?: FixPacket;
-  documentInput?: DocumentTaskInput;
   intent?: StepAnnouncementIntent;
   /** A provider session an earlier step on this same agent left behind; resumed when the provider can, so the prior
    * turns never have to be re-sent through the packet. */
@@ -29,7 +26,7 @@ export interface StepExecutionInput {
   signal: AbortSignal;
 }
 export interface WorkflowStepExecutor {
-  describe(profile: RoleExecutionProfile): Promise<ResolvedProfileDisplay>;
+  describe(profile: AgentProfile): Promise<ResolvedProfileDisplay>;
   execute(input: StepExecutionInput): Promise<WorkflowStepResult>;
   cancel?(): Promise<void>;
 }
@@ -38,7 +35,7 @@ export class AgentStepExecutor implements WorkflowStepExecutor {
   private activeSessionId?: string;
   constructor(private readonly agents: AgentManager) {}
 
-  async describe(profile: RoleExecutionProfile): Promise<ResolvedProfileDisplay> {
+  async describe(profile: AgentProfile): Promise<ResolvedProfileDisplay> {
     const agent = this.agents.registry.get(profile.agentId);
     const descriptor = await agent.discover();
     const models = await agent.listModels().catch(() => []);
@@ -110,8 +107,7 @@ export class AgentStepExecutor implements WorkflowStepExecutor {
    */
   private async supportedControls(input: StepExecutionInput): Promise<Pick<AgentRequest, "mode" | "model" | "effort">> {
     const { capabilities } = await this.agents.registry.get(input.profile.agentId).discover();
-    const requested = this.defaultMode(input.node);
-    const mode = requested === "plan" && !capabilities.planMode ? "execute" : requested;
+    const mode = "execute" as const;
     const model = capabilities.modelSelection ? input.profile.modelId : undefined;
     const effort = capabilities.effortControl ? input.profile.effort : undefined;
     return { mode, ...(model === undefined ? {} : { model }), ...(effort === undefined ? {} : { effort }) };
@@ -131,12 +127,6 @@ export class AgentStepExecutor implements WorkflowStepExecutor {
     sections.push(`If the plan, a decision, or an open question changed, end with a ${STATE_FENCE} block containing`
       + ` only {"planItems":[{"id","title","status":pending|in_progress|done|dropped}],"decisions":[],"openQuestions":[]}.`
       + " Include only the keys that changed, and reuse an existing plan item id to revise it.");
-    if (input.node.type === "review_gate") sections.push("Return a final JSON object with verdict, summary, findings, testsObserved, and confidence.");
-    if (input.node.type === "document") sections.push(renderPacket("Document task input", input.documentInput));
-    if (input.node.type === "role_task" && input.node.role === "bugfix") sections.push(
-      "Address blocking review finding IDs first; avoid unrelated refactoring; report unresolved findings.",
-      renderPacket("Fix packet", input.fixPacket),
-    );
     return sections.filter((section) => section.trim().length > 0).join("\n\n");
   }
 
@@ -155,10 +145,8 @@ export class AgentStepExecutor implements WorkflowStepExecutor {
     // Stripped before anything else reads the message: the review gate scans for a bare JSON object and would
     // otherwise swallow the state block, and the stored summary should not repeat what the state already holds.
     const { text, update } = this.parseStateUpdate(messages);
-    const review = input.node.type === "review_gate" ? this.parseReview(text) : undefined;
-    const artifacts = input.node.type === "document" && input.node.path !== undefined ? [{ id: randomUUID(), kind: input.node.documentKind,
-      path: input.node.path, createdByStepRunId: input.stepRunId }] : [];
-    return workflowStepResultSchema.parse({ stepRunId: input.stepRunId, nodeId: input.node.id, role: input.node.role,
+    return workflowStepResultSchema.parse({ stepRunId: input.stepRunId, nodeId: input.node.id,
+      agentProfileId: input.profile.id, agentName: input.profile.name,
       agentId: input.profile.agentId, ...(session.providerSessionId === undefined ? {} : { providerSessionId: session.providerSessionId }),
       ...(input.profile.modelId === undefined ? {} : { modelId: input.profile.modelId }),
       ...(input.profile.effort === undefined ? {} : { effort: input.profile.effort }),
@@ -169,9 +157,7 @@ export class AgentStepExecutor implements WorkflowStepExecutor {
       filesRead, filesChanged, ...(diff === undefined ? {} : { diff }), commandsRun: commands,
       testsRun: commands.filter((command) => command.command.some((part) => /test/u.test(part))).map((command) => ({
         command: command.command.join(" "), passed: command.exitCode === 0, exitCode: command.exitCode,
-      })), artifacts,
-      ...(review === undefined ? {} : { findings: review.findings, reviewVerdict: review.verdict,
-        unresolvedIssues: review.findings.filter((finding) => finding.severity === "critical" || finding.severity === "high").map((finding) => finding.title) }),
+      })),
     });
   }
 
@@ -203,19 +189,4 @@ export class AgentStepExecutor implements WorkflowStepExecutor {
     try { return JSON.parse(value) as unknown; } catch { return undefined; }
   }
 
-  private parseReview(text: string) {
-    const start = text.indexOf("{"); const end = text.lastIndexOf("}");
-    if (start < 0 || end < start) throw new AgentError("PROTOCOL_ERROR", "Review step did not return structured JSON");
-    return reviewResultSchema.parse(JSON.parse(text.slice(start, end + 1)) as unknown);
-  }
-  /**
-   * Mode is the role restated, so it is derived rather than configured: a Review role in Execute mode was a
-   * contradiction the settings grid used to allow. Providers vary in what they honor — only plan mode changes
-   * anything on Claude and Antigravity, and Codex and OpenCode ignore mode entirely — so this stays advisory.
-   */
-  private defaultMode(node: StepExecutionInput["node"]): "execute" | "plan" | "review" {
-    if (node.type === "review_gate" || node.type === "role_task" && node.role === "review") return "review";
-    if (node.type === "role_task" && node.role === "planning") return "plan";
-    return "execute";
-  }
 }
