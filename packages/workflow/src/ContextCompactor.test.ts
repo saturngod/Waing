@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { WorkflowStepResult } from "@waing/domain";
-import { compactHistory, DEFAULT_COMPACTION_BUDGET, latestTestPerCommand, renderPacket, withoutDiff } from "./ContextCompactor";
+import type { ConversationMemory, WorkflowStepResult } from "@waing/domain";
+import { compactConversationMemory, compactHistory, DEFAULT_COMPACTION_BUDGET, latestTestPerCommand, renderPacket, withoutDiff } from "./ContextCompactor";
 
 function step(index: number, overrides: Partial<WorkflowStepResult> = {}): WorkflowStepResult {
   return { stepRunId: `step-${String(index)}`, nodeId: `node-${String(index)}`, agentProfileId: "coder", agentName: "Coder", agentId: "fake",
@@ -62,5 +62,15 @@ describe("ContextCompactor", () => {
     // Empty collections carry no information and are omitted entirely.
     expect(rendered).not.toContain("unresolvedIssues");
     expect(rendered.length).toBeLessThan(JSON.stringify(packet).length);
+  });
+
+  it("projects durable memory to a small prompt-safe tail", () => {
+    const memory: ConversationMemory = { conversationId: "c", version: 1, revision: 1, objective: "o".repeat(4_000),
+      requirements: Array.from({ length: 20 }, () => "r".repeat(400)), constraints: [], planItems: [], decisions: [],
+      completedWork: Array.from({ length: 40 }, () => "w".repeat(800)), changedFiles: Array.from({ length: 100 }, (_, i) => `file-${String(i)}`),
+      openQuestions: [], unresolvedIssues: [], stepSummaries: [], updatedAt: "2026-08-12T00:00:00.000Z" };
+    const compacted = compactConversationMemory(memory);
+    expect(compacted.requirements).toHaveLength(10); expect(compacted.completedWork).toHaveLength(12); expect(compacted.changedFiles).toHaveLength(60);
+    expect(compacted.objective.length).toBeLessThanOrEqual(2_013);
   });
 });

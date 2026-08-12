@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { AgentError, routerCheckpointInputSchema, routerOrchestrationDecisionSchema } from "@waing/domain";
-import type { AgentProfile, RouterCheckpointInput, RouterCheckpointReason, RouterDecisionRecord, RouterOrchestrationDecision,
-  WorkflowContext, WorkflowDefinition, WorkflowEdge, WorkflowHandoffPacket, WorkflowNode, WorkflowRun } from "@waing/domain";
+import type { AgentProfile, ConversationMemory, RouterCheckpointInput, RouterCheckpointReason, RouterDecisionRecord,
+  RouterOrchestrationDecision, WorkflowContext, WorkflowDefinition, WorkflowEdge, WorkflowHandoffPacket, WorkflowNode,
+  WorkflowRun } from "@waing/domain";
 import { renderAnnouncement } from "./AnnouncementRenderer";
-import { compactDiff, compactHistory, DEFAULT_COMPACTION_BUDGET, dedupe, withoutDiff } from "./ContextCompactor";
+import { compactConversationMemory, compactDiff, compactHistory, DEFAULT_COMPACTION_BUDGET, dedupe, withoutDiff } from "./ContextCompactor";
 import type { CompactionBudget } from "./ContextCompactor";
 import { ContextStore } from "./ContextStore";
 import { ProfileResolver } from "./ProfileResolver";
@@ -14,7 +15,19 @@ import { WorkflowValidator } from "./WorkflowValidator";
 
 export interface WorkflowRouter { decideNext(input: RouterCheckpointInput): Promise<unknown> }
 export interface RouterLoopPolicy { maxRouterDecisions: number; maxSameActionWithoutStateChange: number; onExhausted: "ask_user" | "fail_workflow" }
-export interface WorkflowStartInput { definition: WorkflowDefinition; profiles: AgentProfile[]; projectId: string; projectRoot: string; task: string }
+export interface WorkflowStartInput {
+  definition: WorkflowDefinition;
+  profiles: AgentProfile[];
+  projectId: string;
+  projectRoot: string;
+  task: string;
+  /** Memory from the user-visible conversation, omitted for a brand-new conversation. */
+  conversationMemory?: ConversationMemory;
+  /** Provider session ids keyed by agent profile id and configuration lane. */
+  providerSessions?: Record<string, string>;
+  /** Memory revision last delivered to each resumed provider session lane. */
+  providerSessionMemoryRevisions?: Record<string, number>;
+}
 
 export class WorkflowEngine {
   private paused = false;
@@ -33,7 +46,13 @@ export class WorkflowEngine {
     await this.transition(run, "validating");
     const context: WorkflowContext = { workflowRunId: run.id, projectId: input.projectId, projectRoot: input.projectRoot,
       originalUserTask: input.task, stateVersion: 0, routerDecisionCount: 0, routerDecisionHistory: [], activeNodeId: definition.entryNodeId,
-      completedNodeIds: [], stepResults: [], loopState: {}, providerSessions: {}, sharedState: { planItems: [], decisions: [], openQuestions: [] } };
+      completedNodeIds: [], stepResults: [], loopState: {}, providerSessions: { ...input.providerSessions },
+      providerSessionMemoryRevisions: { ...input.providerSessionMemoryRevisions },
+      sharedState: input.conversationMemory === undefined ? { planItems: [], decisions: [], openQuestions: [] } : {
+        planItems: structuredClone(input.conversationMemory.planItems), decisions: structuredClone(input.conversationMemory.decisions),
+        openQuestions: structuredClone(input.conversationMemory.openQuestions),
+      },
+      ...(input.conversationMemory === undefined ? {} : { conversationMemory: structuredClone(input.conversationMemory) }) };
     const store = new ContextStore(this.repository); await store.initialize(context); await this.transition(run, "ready");
     this.events.publish({ type: "workflow.started", workflowRunId: run.id });
     const profiles = new ProfileResolver(input.profiles);
@@ -57,12 +76,15 @@ export class WorkflowEngine {
           ...(context.latestRouterDecision === undefined ? {} : { intent: context.latestRouterDecision.statusIntent }) });
         await this.repository.saveAnnouncement?.(announcement); this.events.publish({ type: "workflow.step.announced", announcement });
         this.events.publish({ type: "workflow.node.started", nodeId: node.id, stepRunId });
-        const retained = context.providerSessions[profile.agentId];
+        const retained = context.providerSessions[profile.id];
         const result = await this.executor.execute({ stepRunId, node, profile, context, handoff: this.handoff(context, node, retained),
           ...(retained === undefined ? {} : { resumeProviderSessionId: retained }), signal: this.controller.signal });
         await store.recordStep(context, result);
         if (result.stateUpdate !== undefined) this.events.publish({ type: "workflow.state.updated", sharedState: structuredClone(context.sharedState) });
-        if (result.providerSessionId !== undefined) context.providerSessions[profile.agentId] = result.providerSessionId;
+        if (result.providerSessionId !== undefined) {
+          context.providerSessions[profile.id] = result.providerSessionId;
+          if (context.conversationMemory !== undefined) context.providerSessionMemoryRevisions[profile.id] = context.conversationMemory.revision;
+        }
         if (result.status !== "completed") throw new AgentError(result.status === "cancelled" ? "CANCELLED" : "PROCESS_FAILED", result.summary, profile.agentId, result.status === "failed", true);
         this.events.publish({ type: "workflow.node.completed", nodeId: node.id, stepRunId }); await this.transition(run, "node_completed");
         const edge = this.nextAlways(definition, node.id); await this.takeEdge(context.workflowRunId, edge); context.activeNodeId = edge.to;
@@ -89,6 +111,7 @@ export class WorkflowEngine {
       ...(latest === undefined ? {} : { latestStepResult: withoutDiff(latest, this.compaction) }), priorStepSummaries: history.summaries,
       ...(history.omittedStepCount === 0 ? {} : { omittedStepCount: history.omittedStepCount }),
       ...(this.hasSharedState(context) ? { sharedState: context.sharedState } : {}),
+      ...(context.conversationMemory === undefined ? {} : { conversationMemory: compactConversationMemory(context.conversationMemory) }),
       availableAgents: roster.filter((profile) => profile.enabled).map(({ id, name, whereToUse }) => ({ id, name, whereToUse })),
       allowedActions: node.allowedActions });
     const decision = routerOrchestrationDecisionSchema.parse(await this.router.decideNext(checkpoint));
@@ -123,10 +146,13 @@ export class WorkflowEngine {
   private handoff(context: WorkflowContext, node: Extract<WorkflowNode, { type: "role_task" }>, retained?: string): WorkflowHandoffPacket {
     const carried = retained === undefined ? context.stepResults : context.stepResults.filter((result) => result.providerSessionId !== retained);
     const history = compactHistory(carried, this.compaction); const diff = compactDiff(this.latestDiff(context), this.compaction);
+    const deliveredRevision = context.providerSessionMemoryRevisions[node.agentProfileId] ?? 0;
+    const memoryChanged = context.conversationMemory !== undefined && deliveredRevision < context.conversationMemory.revision;
     return { originalTask: context.originalUserTask, currentGoal: node.label, priorStepSummaries: history.summaries,
       ...(history.changedFiles.length === 0 ? {} : { changedFiles: history.changedFiles }),
       ...(history.omittedStepCount === 0 ? {} : { omittedStepCount: history.omittedStepCount }), ...(diff === undefined ? {} : { currentDiff: diff }),
       ...(retained === undefined ? {} : { providerSessionRetained: true }), ...(this.hasSharedState(context) ? { sharedState: context.sharedState } : {}),
+      ...(memoryChanged ? { conversationMemory: compactConversationMemory(context.conversationMemory!) } : {}),
       unresolvedIssues: dedupe(context.stepResults.flatMap((result) => result.unresolvedIssues ?? [])) };
   }
   private hasSharedState(context: WorkflowContext): boolean { const s = context.sharedState; return s.planItems.length + s.decisions.length + s.openQuestions.length > 0; }

@@ -62,10 +62,35 @@ export type WorkflowStepResult = z.infer<typeof workflowStepResultSchema>;
 export const stepSummaryEntrySchema = z.object({ agentProfileId: z.string().min(1), agentName: z.string().min(1),
   summary: z.string(), filesChanged: z.array(z.string()), testsRun: z.array(testRecordSchema), collapsed: z.boolean().optional() }).strict();
 export type StepSummaryEntry = z.infer<typeof stepSummaryEntrySchema>;
+
+/**
+ * Durable, provider-neutral memory for one user-visible conversation. The full transcript remains available for
+ * replay, but this bounded projection is what a new workflow or a different provider receives by default.
+ */
+export const conversationMemorySchema = z.object({
+  conversationId: z.string().min(1),
+  version: z.literal(1),
+  revision: z.number().int().nonnegative(),
+  objective: z.string().max(4_000),
+  requirements: z.array(z.string().min(1).max(400)).max(20),
+  constraints: z.array(z.string().min(1).max(400)).max(20),
+  planItems: z.array(planItemSchema).max(40),
+  decisions: z.array(z.string().min(1).max(300)).max(20),
+  completedWork: z.array(z.string().min(1).max(800)).max(40),
+  changedFiles: z.array(z.string().min(1).max(500)).max(100),
+  openQuestions: z.array(z.string().min(1).max(300)).max(20),
+  unresolvedIssues: z.array(z.string().min(1).max(800)).max(40),
+  stepSummaries: z.array(stepSummaryEntrySchema).max(8),
+  lastVerification: z.object({ summary: z.string().max(1_200), testsRun: z.array(testRecordSchema).max(20) }).strict().optional(),
+  updatedAt: z.string().datetime(),
+}).strict();
+export type ConversationMemory = z.infer<typeof conversationMemorySchema>;
+
 export const workflowHandoffPacketSchema = z.object({ originalTask: z.string(), currentGoal: z.string(),
   priorStepSummaries: z.array(stepSummaryEntrySchema), currentDiff: z.string().optional(), unresolvedIssues: z.array(z.string()),
   changedFiles: z.array(z.string()).optional(), omittedStepCount: z.number().int().min(0).optional(),
-  providerSessionRetained: z.boolean().optional(), sharedState: workflowSharedStateSchema.optional() }).strict();
+  providerSessionRetained: z.boolean().optional(), sharedState: workflowSharedStateSchema.optional(),
+  conversationMemory: conversationMemorySchema.optional() }).strict();
 export type WorkflowHandoffPacket = z.infer<typeof workflowHandoffPacketSchema>;
 
 export const stepActivityKindSchema = z.enum(["routing", "creating_prd", "updating_prd", "implementing", "planning",
@@ -86,7 +111,8 @@ export const availableAgentSchema = z.object({ id: z.string().min(1), name: z.st
 export const routerCheckpointInputSchema = z.object({ checkpointReason: routerCheckpointReasonSchema,
   originalUserTask: z.string(), latestStepResult: workflowStepResultSchema.optional(),
   priorStepSummaries: z.array(stepSummaryEntrySchema), omittedStepCount: z.number().int().min(0).optional(),
-  sharedState: workflowSharedStateSchema.optional(), availableAgents: z.array(availableAgentSchema).min(1),
+  sharedState: workflowSharedStateSchema.optional(), conversationMemory: conversationMemorySchema.optional(),
+  availableAgents: z.array(availableAgentSchema).min(1),
   allowedActions: z.array(routerActionSchema).min(1) }).strict();
 export type RouterCheckpointInput = z.infer<typeof routerCheckpointInputSchema>;
 export const routerOrchestrationDecisionSchema = z.object({ action: routerActionSchema,
@@ -108,7 +134,9 @@ export const workflowContextSchema = z.object({ workflowRunId: z.string(), proje
   activeNodeId: z.string(), completedNodeIds: z.array(z.string()), stepResults: z.array(workflowStepResultSchema),
   loopState: z.record(z.string(), z.object({ iteration: z.number().int().min(0), maxIterations: z.number().int().positive() }).strict()),
   providerSessions: z.record(z.string(), z.string()).default({}),
-  sharedState: workflowSharedStateSchema.default({ planItems: [], decisions: [], openQuestions: [] }) }).strict();
+  providerSessionMemoryRevisions: z.record(z.string(), z.number().int().nonnegative()).default({}),
+  sharedState: workflowSharedStateSchema.default({ planItems: [], decisions: [], openQuestions: [] }),
+  conversationMemory: conversationMemorySchema.optional() }).strict();
 export type WorkflowContext = z.infer<typeof workflowContextSchema>;
 
 export const workflowRunStatusSchema = z.enum(["created", "validating", "ready", "running_node", "waiting_permission",

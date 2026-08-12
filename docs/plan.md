@@ -2512,7 +2512,8 @@ export interface WorkflowContext {
     maxIterations: number;
   }>;
 
-  // agentId → provider session id, so a later step on the same agent resumes instead of restarting.
+  // agent profile/configuration lane → provider session id, so a later step on the same configured role resumes
+  // instead of restarting or accidentally sharing context with another role.
   providerSessions: Record<string, string>;
 
   // Small, structured, and exempt from compaction — the part of the run that must survive every handoff.
@@ -2527,6 +2528,13 @@ export interface WorkflowSharedState {
 ```
 
 Provider sessions can be reused within a role when safe, but the workflow context is provider-neutral.
+
+The user-visible conversation also persists a bounded `ConversationMemory` projection containing the objective,
+requirements/constraints, plan items, decisions, completed work, changed files, open questions, unresolved issues,
+recent step summaries, and latest verification. The full transcript remains local for replay; it is not routinely
+resent to a provider. Each provider session lane stores the memory revision it last received, so a resumed lane gets
+only the current user request when its memory is current and receives the bounded memory snapshot when another role
+has advanced it.
 
 A step amends `sharedState` by ending its final message with a ```` ```waing-state ```` block holding only the keys it
 changed; plan items are addressed by id so a revision replaces rather than appends. The block is advisory — a provider
@@ -2584,6 +2592,12 @@ compacted, so the timeline and replay keep the full text:
   packet.
 - **Never compacted.** `sharedState` and `unresolvedIssues` travel whole, always. They are what a later step must act
   on, and they are small enough to afford.
+
+Conversation memory is versioned and persisted per conversation. A workflow run bootstraps its shared state from that
+memory and writes the next revision after the run. Provider session lanes are keyed by role/profile configuration
+(provider, model, effort, instructions, permission profile, and mode), so changing any of those values intentionally
+starts a fresh lane. Usage updates are persisted separately, including router sessions, so orchestration cost can be
+audited instead of being hidden from the worker transcript.
 
 Packets are rendered as headed plain text rather than JSON; identical content costs roughly half the tokens once
 braces, quotes, and repeated keys are gone, and empty fields render to nothing.

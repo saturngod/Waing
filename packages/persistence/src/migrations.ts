@@ -69,4 +69,41 @@ CREATE TABLE workflow_announcements (step_run_id TEXT PRIMARY KEY, workflow_run_
   announcement_json TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE INDEX idx_steps_workflow_run ON workflow_step_runs(workflow_run_id);
 `,
+}, {
+  version: 3,
+  name: "conversation_memory_session_lanes_and_usage",
+  sql: `
+CREATE TABLE conversation_memory (
+  conversation_id TEXT PRIMARY KEY REFERENCES conversations(id),
+  version INTEGER NOT NULL,
+  revision INTEGER NOT NULL,
+  memory_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE provider_session_lanes (
+  conversation_id TEXT NOT NULL REFERENCES conversations(id),
+  lane_key TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  provider_session_id TEXT NOT NULL,
+  memory_revision INTEGER NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (conversation_id, lane_key)
+);
+CREATE TABLE usage_records (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT REFERENCES conversations(id),
+  workflow_run_id TEXT,
+  session_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  model_id TEXT,
+  input_tokens INTEGER NOT NULL,
+  output_tokens INTEGER NOT NULL,
+  cached_input_tokens INTEGER,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_session_lanes_conversation ON provider_session_lanes(conversation_id, updated_at);
+CREATE INDEX idx_usage_conversation ON usage_records(conversation_id, created_at);
+`,
 }];

@@ -1,4 +1,4 @@
-import type { StepSummaryEntry, TestRecord, WorkflowStepResult } from "@waing/domain";
+import type { ConversationMemory, StepSummaryEntry, TestRecord, WorkflowStepResult } from "@waing/domain";
 
 /**
  * Every packet the engine hands to an agent is a projection of `WorkflowContext.stepResults`, and a step summary is the
@@ -84,6 +84,26 @@ export function withoutDiff(result: WorkflowStepResult, budget: CompactionBudget
 /** Only a reviewer needs the literal diff; every other role is in the workspace and can read the files directly. */
 export function compactDiff(diff: string | undefined, budget: CompactionBudget = DEFAULT_COMPACTION_BUDGET): string | undefined {
   return diff === undefined ? undefined : clip(diff, budget.diffChars);
+}
+
+/** Prompt projection for conversation memory; the persisted memory remains lossless within its schema bounds. */
+export function compactConversationMemory(memory: ConversationMemory): ConversationMemory {
+  return {
+    ...memory,
+    objective: clip(memory.objective, 2_000),
+    requirements: memory.requirements.slice(-10).map((value) => clip(value, 240)),
+    constraints: memory.constraints.slice(-10).map((value) => clip(value, 240)),
+    planItems: memory.planItems.slice(-20),
+    decisions: memory.decisions.slice(-12).map((value) => clip(value, 240)),
+    completedWork: memory.completedWork.slice(-12).map((value) => clip(value, 500)),
+    changedFiles: memory.changedFiles.slice(-60),
+    openQuestions: memory.openQuestions.slice(-12).map((value) => clip(value, 240)),
+    unresolvedIssues: memory.unresolvedIssues.slice(-12).map((value) => clip(value, 500)),
+    stepSummaries: memory.stepSummaries.slice(-6).map((summary) => ({ ...summary, summary: clip(summary.summary, 700),
+      filesChanged: summary.filesChanged.slice(-12), testsRun: failingTests(summary.testsRun).slice(-12) })),
+    ...(memory.lastVerification === undefined ? {} : { lastVerification: { summary: clip(memory.lastVerification.summary, 700),
+      testsRun: failingTests(memory.lastVerification.testsRun).slice(-12) } }),
+  };
 }
 
 /** Loops re-report the same blockers every iteration, so the same string is never sent twice. */

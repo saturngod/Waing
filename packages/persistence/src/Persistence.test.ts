@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { DatabaseSync } from "node:sqlite";
-import type { AgentProfile } from "@waing/domain";
+import type { AgentEvent, AgentProfile, AppConversation, ConversationMemory, Project } from "@waing/domain";
 import { PersistenceStore } from "./PersistenceStore";
 import { SqliteDatabase } from "./SqliteDatabase";
 import { SqliteWorkflowRepository } from "./SqliteWorkflowRepository";
@@ -17,6 +17,7 @@ describe("agent persistence", () => {
     database = new SqliteDatabase(":memory:");
     const tables = database.connection.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((row) => String(row.name));
     expect(tables).toContain("agent_profiles");
+    expect(tables).toContain("conversation_memory"); expect(tables).toContain("provider_session_lanes"); expect(tables).toContain("usage_records");
     expect(tables).not.toContain("workflow_role_profiles"); expect(tables).not.toContain("workflow_reviews");
   });
   it("upgrades a database that already applied the old v1 schema", () => {
@@ -48,5 +49,25 @@ describe("agent persistence", () => {
     await repository.saveStepResult("run", { stepRunId: "step", nodeId: "coder", agentProfileId: "coder", agentName: "Coder",
       agentId: "codex", status: "completed", summary: "done", filesRead: [], filesChanged: [], commandsRun: [], testsRun: [] });
     expect(repository.loadHistory("run").steps[0]).toMatchObject({ agentProfileId: "coder", agentName: "Coder" });
+  });
+  it("persists bounded conversation memory, session lanes, and usage records", () => {
+    database = new SqliteDatabase(":memory:"); const store = new PersistenceStore(database);
+    const now = new Date().toISOString();
+    const project: Project = { id: "project", name: "Project", root: "/tmp/project" };
+    const conversation: AppConversation = { id: "conversation", projectId: project.id, title: "Task", createdAt: now, updatedAt: now };
+    store.saveProject({ ...project, realPath: project.root, createdAt: now, lastOpenedAt: now }); store.saveConversation(conversation);
+    const memory: ConversationMemory = { conversationId: conversation.id, version: 1, revision: 1, objective: "Ship the task",
+      requirements: [], constraints: [], planItems: [], decisions: ["Use the existing adapter"], completedWork: ["Inspected the project"],
+      changedFiles: ["src/index.ts"], openQuestions: [], unresolvedIssues: [], stepSummaries: [], updatedAt: now };
+    store.saveConversationMemory(memory); expect(store.getConversationMemory(conversation.id)).toEqual(memory);
+    store.saveSessionLane({ conversationId: conversation.id, laneKey: "lane", agentId: "codex", providerSessionId: "thread-1", memoryRevision: 1, updatedAt: now });
+    expect(store.getSessionLane(conversation.id, "lane")).toMatchObject({ agentId: "codex", providerSessionId: "thread-1" });
+    const event: AgentEvent = { id: "usage-1", sessionId: "session", runId: "run", agentId: "codex", timestamp: now, sequence: 1,
+      type: "usage.updated", inputTokens: 100, outputTokens: 20 };
+    store.saveUsageRecord({ event, conversationId: conversation.id, workflowRunId: "workflow", scope: "worker" });
+    expect(store.listUsageRecords(conversation.id)).toMatchObject([{ id: "usage-1", scope: "worker", inputTokens: 100, outputTokens: 20 }]);
+    store.removeConversation(conversation.id);
+    expect(store.getConversationMemory(conversation.id)).toBeUndefined(); expect(store.listSessionLanes(conversation.id)).toEqual([]);
+    expect(store.listUsageRecords(conversation.id)).toEqual([]);
   });
 });

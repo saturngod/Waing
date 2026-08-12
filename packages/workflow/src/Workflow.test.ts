@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { AgentProfile, WorkflowStepResult } from "@waing/domain";
+import type { AgentProfile, ConversationMemory, WorkflowStepResult } from "@waing/domain";
 import { InMemoryWorkflowRepository } from "./WorkflowRepository";
 import { WorkflowCompiler } from "./WorkflowCompiler";
 import { WorkflowEngine } from "./WorkflowEngine";
@@ -33,5 +33,18 @@ describe("adaptive agent workflow", () => {
       { decideNext: () => Promise.resolve(decisions.shift()) }).run({ definition: new WorkflowCompiler().compileAdaptive(profiles), profiles,
         projectId: "p", projectRoot: "/tmp", task: "build" });
     expect(result.run.status).toBe("completed"); expect(executor.calls[1]?.handoff.currentDiff).toBe("@@ change @@");
+  });
+  it("resends memory only when a resumed lane has not seen the current revision", async () => {
+    const profiles = [profile(0)]; const executor = new Executor();
+    const memory: ConversationMemory = { conversationId: "conversation", version: 1, revision: 2, objective: "Build it", requirements: [],
+      constraints: [], planItems: [], decisions: [], completedWork: [], changedFiles: [], openQuestions: [], unresolvedIssues: [], stepSummaries: [],
+      updatedAt: "2026-08-12T00:00:00.000Z" };
+    const decisions = [{ action: "delegate", agentProfileId: "agent-0", statusIntent: { activity: "implementing" }, rationale: "code", confidence: 1 },
+      { action: "complete", statusIntent: { activity: "implementing" }, rationale: "done", confidence: 1 }];
+    await new WorkflowEngine(new InMemoryWorkflowRepository(), executor,
+      { decideNext: () => Promise.resolve(decisions.shift()) }).run({ definition: new WorkflowCompiler().compileAdaptive(profiles), profiles,
+        projectId: "p", projectRoot: "/tmp", task: "follow up", conversationMemory: memory,
+        providerSessions: { "agent-0": "thread" }, providerSessionMemoryRevisions: { "agent-0": 1 } });
+    expect(executor.calls[0]?.handoff.conversationMemory?.revision).toBe(2);
   });
 });

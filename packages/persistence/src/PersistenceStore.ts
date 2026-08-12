@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type {
-  AgentEvent, AgentProfile, AppConversation, PermissionDecision, PermissionRequest, Project, StepAnnouncement,
+  AgentEvent, AgentProfile, AppConversation, ConversationMemory, PermissionDecision, PermissionRequest, Project, StepAnnouncement,
 } from "@waing/domain";
+import { conversationMemorySchema } from "@waing/domain";
 import type { SqliteDatabase } from "./SqliteDatabase";
 
 export interface PersistedProject extends Project { realPath: string; createdAt: string; lastOpenedAt: string;
@@ -10,6 +11,11 @@ export interface PersistedMessage { id: string; conversationId: string; role: "u
   content: string; createdAt: string }
 export interface PersistedProviderSession { id: string; conversationId: string; agentId: string; providerSessionId?: string;
   status: string; payload: unknown; updatedAt: string }
+export interface PersistedSessionLane { conversationId: string; laneKey: string; agentId: string; providerSessionId: string;
+  memoryRevision: number; updatedAt: string }
+export interface PersistedUsageRecord { id: string; conversationId?: string; workflowRunId?: string; sessionId: string; runId: string;
+  scope: "router" | "worker" | "direct"; agentId: string; modelId?: string; inputTokens: number; outputTokens: number;
+  cachedInputTokens?: number; createdAt: string }
 
 export class PersistenceStore {
   constructor(private readonly database: SqliteDatabase) {}
@@ -40,7 +46,10 @@ export class PersistenceStore {
     const statements = [
       `DELETE FROM messages WHERE conversation_id IN (${conversationScope})`,
       `DELETE FROM provider_sessions WHERE conversation_id IN (${conversationScope})`,
+      `DELETE FROM conversation_memory WHERE conversation_id IN (${conversationScope})`,
+      `DELETE FROM provider_session_lanes WHERE conversation_id IN (${conversationScope})`,
       `DELETE FROM agent_events WHERE conversation_id IN (${conversationScope})`,
+      `DELETE FROM usage_records WHERE conversation_id IN (${conversationScope})`,
       "DELETE FROM permission_decisions WHERE project_id=?",
       "DELETE FROM conversations WHERE project_id=?",
       "DELETE FROM projects WHERE id=?",
@@ -69,7 +78,8 @@ export class PersistenceStore {
   }
   removeConversation(conversationId: string): void {
     const statements = ["DELETE FROM messages WHERE conversation_id=?", "DELETE FROM provider_sessions WHERE conversation_id=?",
-      "DELETE FROM agent_events WHERE conversation_id=?",
+      "DELETE FROM conversation_memory WHERE conversation_id=?", "DELETE FROM provider_session_lanes WHERE conversation_id=?",
+      "DELETE FROM agent_events WHERE conversation_id=?", "DELETE FROM usage_records WHERE conversation_id=?",
       "DELETE FROM conversations WHERE id=?"];
     this.database.connection.exec("BEGIN");
     try {
@@ -95,6 +105,40 @@ export class PersistenceStore {
       ...(typeof row.provider_session_id === "string" ? { providerSessionId: row.provider_session_id } : {}), status: String(row.status),
       payload: JSON.parse(String(row.payload_json)) as unknown, updatedAt: String(row.updated_at) }));
   }
+  saveConversationMemory(memory: ConversationMemory): void {
+    const validated = conversationMemorySchema.parse(memory);
+    this.database.connection.prepare(`INSERT INTO conversation_memory(conversation_id,version,revision,memory_json,updated_at)
+      VALUES(?,?,?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET version=excluded.version,revision=excluded.revision,
+      memory_json=excluded.memory_json,updated_at=excluded.updated_at`).run(validated.conversationId, validated.version,
+      validated.revision, JSON.stringify(validated), validated.updatedAt);
+  }
+  getConversationMemory(conversationId: string): ConversationMemory | undefined {
+    const row = this.database.connection.prepare("SELECT memory_json FROM conversation_memory WHERE conversation_id=?").get(conversationId) as { memory_json?: unknown } | undefined;
+    if (typeof row?.memory_json !== "string") return undefined;
+    try {
+      const parsed = conversationMemorySchema.safeParse(JSON.parse(row.memory_json) as unknown);
+      return parsed.success ? parsed.data : undefined;
+    } catch { return undefined; }
+  }
+  saveSessionLane(lane: PersistedSessionLane): void {
+    this.database.connection.prepare(`INSERT INTO provider_session_lanes(conversation_id,lane_key,agent_id,provider_session_id,memory_revision,updated_at)
+      VALUES(?,?,?,?,?,?) ON CONFLICT(conversation_id,lane_key) DO UPDATE SET agent_id=excluded.agent_id,
+      provider_session_id=excluded.provider_session_id,memory_revision=excluded.memory_revision,updated_at=excluded.updated_at`)
+      .run(lane.conversationId, lane.laneKey, lane.agentId, lane.providerSessionId, lane.memoryRevision, lane.updatedAt);
+  }
+  getSessionLane(conversationId: string, laneKey: string): PersistedSessionLane | undefined {
+    const row = this.database.connection.prepare("SELECT * FROM provider_session_lanes WHERE conversation_id=? AND lane_key=?")
+      .get(conversationId, laneKey) as Record<string, unknown> | undefined;
+    if (row === undefined) return undefined;
+    return { conversationId: String(row.conversation_id), laneKey: String(row.lane_key), agentId: String(row.agent_id),
+      providerSessionId: String(row.provider_session_id), memoryRevision: Number(row.memory_revision), updatedAt: String(row.updated_at) };
+  }
+  listSessionLanes(conversationId: string): PersistedSessionLane[] {
+    const rows = this.database.connection.prepare("SELECT * FROM provider_session_lanes WHERE conversation_id=? ORDER BY updated_at DESC")
+      .all(conversationId) as Record<string, unknown>[];
+    return rows.map((row) => ({ conversationId: String(row.conversation_id), laneKey: String(row.lane_key), agentId: String(row.agent_id),
+      providerSessionId: String(row.provider_session_id), memoryRevision: Number(row.memory_revision), updatedAt: String(row.updated_at) }));
+  }
   recoverInterruptedSessions(): number {
     const result = this.database.connection.prepare(`UPDATE provider_sessions SET status='failed',updated_at=?
       WHERE status IN ('starting','running','waiting_permission','cancelling')`).run(new Date().toISOString());
@@ -119,6 +163,24 @@ export class PersistenceStore {
     this.database.connection.prepare("INSERT INTO agent_events(id,conversation_id,workflow_run_id,event_type,payload_json,created_at) VALUES(?,?,?,?,?,?)")
       .run(event.id, conversationId ?? null, event.workflowRunId ?? null, event.type, JSON.stringify(event), event.timestamp);
     return true;
+  }
+  saveUsageRecord(input: { event: Extract<AgentEvent, { type: "usage.updated" }>; conversationId?: string;
+    workflowRunId?: string; scope: PersistedUsageRecord["scope"]; modelId?: string; cachedInputTokens?: number }): void {
+    const { event } = input;
+    this.database.connection.prepare(`INSERT OR REPLACE INTO usage_records(id,conversation_id,workflow_run_id,session_id,run_id,scope,agent_id,model_id,input_tokens,output_tokens,cached_input_tokens,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(event.id, input.conversationId ?? null, input.workflowRunId ?? null, event.sessionId,
+      event.runId, input.scope, event.agentId, input.modelId ?? null, event.inputTokens, event.outputTokens,
+      input.cachedInputTokens ?? null, event.timestamp);
+  }
+  listUsageRecords(conversationId: string): PersistedUsageRecord[] {
+    const rows = this.database.connection.prepare("SELECT * FROM usage_records WHERE conversation_id=? ORDER BY created_at,rowid")
+      .all(conversationId) as Record<string, unknown>[];
+    return rows.map((row) => ({ id: String(row.id), conversationId: String(row.conversation_id),
+      ...(typeof row.workflow_run_id === "string" ? { workflowRunId: row.workflow_run_id } : {}), sessionId: String(row.session_id),
+      runId: String(row.run_id), scope: String(row.scope) as PersistedUsageRecord["scope"], agentId: String(row.agent_id),
+      ...(typeof row.model_id === "string" ? { modelId: row.model_id } : {}), inputTokens: Number(row.input_tokens),
+      outputTokens: Number(row.output_tokens), ...(row.cached_input_tokens === null ? {} : { cachedInputTokens: Number(row.cached_input_tokens) }),
+      createdAt: String(row.created_at) }));
   }
   savePermission(projectId: string, request: PermissionRequest, decision: PermissionDecision): void {
     this.database.connection.prepare("INSERT INTO permission_decisions(id,project_id,session_id,request_id,decision,request_json,created_at) VALUES(?,?,?,?,?,?,?)")

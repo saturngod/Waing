@@ -11,13 +11,15 @@ import { OpenCodeAdapter } from "@waing/adapter-opencode";
 import { AgentRouterClient, OpenCodeRouterClient, RouterManager } from "@waing/router";
 import type { RouterClient } from "@waing/router";
 import { AgentStepExecutor, InMemoryWorkflowRepository, WorkflowCompiler,
-  WorkflowEngine, WorkflowEventBus, WorkflowValidator, buildDefaultRouterSettings, buildStarterAgentProfiles, sortAgentProfiles } from "@waing/workflow";
+  WorkflowEngine, WorkflowEventBus, WorkflowValidator, buildConversationMemory, buildDefaultRouterSettings,
+  buildStarterAgentProfiles, profileSessionLaneKey, sortAgentProfiles } from "@waing/workflow";
 import { PersistenceStore, SqliteDatabase, SqliteWorkflowRepository } from "@waing/persistence";
 import { IPC_CHANNELS, agentModelsInputSchema, conversationIdInputSchema, conversationRemoveInputSchema, emptyInputSchema,
   agentSettingsInputSchema, attachmentChoiceSchema, attachmentsAddInputSchema, fileSearchInputSchema, permissionResponseInputSchema, questionResponseInputSchema, projectIdInputSchema, runFakeInputSchema,
   sessionCancelInputSchema, sessionSendInputSchema, openLinkInputSchema } from "@waing/ipc-contracts";
 import type { AgentSettingsView, AttachmentChoice, ConversationHistory, SessionSendResult } from "@waing/ipc-contracts";
-import type { AgentDescriptor, AgentProfile, AgentRequest, AppConversation, Project, RouterSettings } from "@waing/domain";
+import { conversationMemorySchema } from "@waing/domain";
+import type { AgentDescriptor, AgentEvent, AgentProfile, AgentRequest, AppConversation, ConversationMemory, Project, RouterSettings } from "@waing/domain";
 import { FakeAgent } from "./FakeAgent";
 import { SecretStore } from "./SecretStore";
 
@@ -38,6 +40,7 @@ let secretStore: SecretStore | undefined;
 const activeChatRuns = new Map<string, WorkflowEngine>();
 /** Routing runs are internal: their events must not reach the transcript as if an agent were answering the user. */
 const routerSessionIds = new Set<string>();
+const routerSessionConversations = new Map<string, string>();
 const ROUTER_TIMEOUT_MS = 90_000;
 let contentSecurityPolicyConfigured = false;
 
@@ -70,6 +73,28 @@ function taskWithConversationHistory(text: string, messages: ReadonlyArray<{ rol
   const boundedTranscript = transcript.length > 20_000 ? transcript.slice(-20_000) : transcript;
   return `Continue the existing Waing conversation. Use its prior plan, decisions, and results as context.\n\n`
     + `Prior conversation:\n${boundedTranscript}\n\nNew user message:\n${text}`;
+}
+/** Keeps direct-agent turns in the same durable memory used by Auto, so a later handoff cannot skip them. */
+function updateDirectConversationMemory(conversationId: string): void {
+  if (persistence === undefined) return;
+  const messages = persistence.listMessages(conversationId);
+  const previous = persistence.getConversationMemory(conversationId);
+  const latestUser = [...messages].reverse().find((message) => message.role === "user");
+  const latestAssistant = [...messages].reverse().find((message) => message.role === "assistant");
+  if (latestUser === undefined || latestAssistant === undefined) return;
+  const changedFiles = persistence.listEvents(conversationId).filter((event): event is Extract<AgentEvent, { type: "file.changed" }> => event.type === "file.changed")
+    .map((event) => event.path);
+  persistence.saveConversationMemory(conversationMemorySchema.parse({
+    conversationId, version: 1, revision: (previous?.revision ?? 0) + 1,
+    objective: previous?.objective || latestUser.content.slice(0, 4_000), requirements: previous?.requirements ?? [],
+    constraints: previous?.constraints ?? [], planItems: previous?.planItems ?? [], decisions: previous?.decisions ?? [],
+    completedWork: [...(previous?.completedWork ?? []), `Direct agent: ${latestAssistant.content.slice(0, 800)}`].slice(-40),
+    changedFiles: [...new Set([...(previous?.changedFiles ?? []), ...changedFiles])].slice(-100),
+    openQuestions: previous?.openQuestions ?? [], unresolvedIssues: previous?.unresolvedIssues ?? [], stepSummaries: [
+      ...(previous?.stepSummaries ?? []), { agentProfileId: "direct", agentName: "Direct agent", summary: latestAssistant.content.slice(0, 1_200), filesChanged: [], testsRun: [] },
+    ].slice(-8), ...(previous?.lastVerification === undefined ? {} : { lastVerification: previous.lastVerification }),
+    updatedAt: new Date().toISOString(),
+  }));
 }
 export function getSecretStore(): SecretStore {
   if (secretStore === undefined) throw new Error("Secret storage is not initialized");
@@ -112,11 +137,22 @@ agentManager.eventBus.subscribe((event) => {
   });
 });
 agentManager.eventBus.subscribe((event) => {
-  if (routerSessionIds.has(event.sessionId)) return;
   const safeEvent = redactSensitiveData(event);
+  const isRouterSession = routerSessionIds.has(event.sessionId);
+  let session: ReturnType<typeof agentManager.sessions.get> | undefined;
+  try { session = agentManager.sessions.get(event.sessionId); } catch { /* stale provider events are still safe to ignore */ }
+  const conversationId = session === undefined
+    ? routerSessionConversations.get(event.sessionId)
+    : workflowConversationIds.get(session.conversationId) ?? session.conversationId;
+  const scope = isRouterSession ? "router" : session !== undefined && workflowConversationIds.has(session.conversationId) ? "worker" : "direct";
+  if (safeEvent.type === "usage.updated" && conversationId !== undefined) {
+    try { persistence?.saveUsageRecord({ event: safeEvent, scope,
+      ...(conversationId === undefined ? {} : { conversationId }),
+      ...(scope === "worker" && session !== undefined ? { workflowRunId: session.conversationId } : {}) }); }
+    catch { /* usage is observational and must not strand a provider run */ }
+  }
+  if (isRouterSession || session === undefined || conversationId === undefined) return;
   try {
-    const session = agentManager.sessions.get(event.sessionId);
-    const conversationId = workflowConversationIds.get(session.conversationId) ?? session.conversationId;
     persistence?.saveProviderSession({ id: session.id, conversationId, agentId: session.agentId,
       ...(session.providerSessionId === undefined ? {} : { providerSessionId: session.providerSessionId }),
       status: session.status, payload: session, updatedAt: session.updatedAt });
@@ -129,6 +165,7 @@ agentManager.eventBus.subscribe((event) => {
       const content = assistantBuffers.get(session.id);
       if (content !== undefined && content.length > 0) persistence?.saveMessage({ id: randomUUID(),
         conversationId, role: "assistant", content, createdAt: safeEvent.timestamp });
+      if (scope === "direct") updateDirectConversationMemory(conversationId);
       assistantBuffers.delete(session.id);
     }
   } catch { /* workflow/session setup can race the first normalized event */ }
@@ -184,22 +221,32 @@ function createRouterClient(profile: RouterSettings | undefined, project: Projec
  * renderer so the chat transcript shows each agent as it starts.
  */
 async function runChatWorkflow(project: Project, task: string, workflowTask = task,
-  existingConversation?: AppConversation): Promise<SessionSendResult> {
+  existingConversation?: AppConversation, conversationMemory?: ConversationMemory): Promise<SessionSendResult> {
   const { profiles, router } = await resolveAgentProfiles();
   await assertAgentsUsable(profiles);
   const definition = new WorkflowCompiler().compileAdaptive(profiles);
   const repository = workflowRepository ?? new InMemoryWorkflowRepository();
   await repository.saveDefinition(definition);
+  const title = existingConversation?.title ?? task.slice(0, 80);
+  let conversation: AppConversation = existingConversation ?? { id: randomUUID(), projectId: project.id, title,
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+  const initialProviderSessions = Object.fromEntries(profiles.filter((profile) => profile.enabled).flatMap((profile) => {
+    const lane = persistence?.getSessionLane(conversation.id, profileSessionLaneKey(profile));
+    return lane === undefined ? [] : [[profile.id, lane.providerSessionId] as const];
+  }));
+  const initialProviderSessionMemoryRevisions = Object.fromEntries(profiles.filter((profile) => profile.enabled).flatMap((profile) => {
+    const lane = persistence?.getSessionLane(conversation.id, profileSessionLaneKey(profile));
+    return lane === undefined ? [] : [[profile.id, lane.memoryRevision] as const];
+  }));
   const ownedRouterSessionIds = new Set<string>();
-  const routerClient = createRouterClient(router, project, (sessionId) => ownedRouterSessionIds.add(sessionId));
+  const routerClient = createRouterClient(router, project, (sessionId) => {
+    ownedRouterSessionIds.add(sessionId); routerSessionConversations.set(sessionId, conversation.id);
+  });
   // A router call may have to cold-start a provider CLI, which routinely outlasts the 15s library default. The chat
   // preset consults the router after every step, so it also needs the larger decision budget that loop is sized for.
   const engine = new WorkflowEngine(repository, new AgentStepExecutor(agentManager),
     new RouterManager(routerClient, ROUTER_TIMEOUT_MS), new WorkflowEventBus(), new WorkflowValidator(),
     { maxRouterDecisions: 20, maxSameActionWithoutStateChange: 2, onExhausted: "ask_user" });
-  const title = existingConversation?.title ?? task.slice(0, 80);
-  let conversation: AppConversation = existingConversation ?? { id: randomUUID(), projectId: project.id, title,
-    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
   let workflowRunId: string | undefined;
   const unsubscribe = engine.events.subscribe((event) => {
     if (event.type === "workflow.started") {
@@ -219,7 +266,18 @@ async function runChatWorkflow(project: Project, task: string, workflowTask = ta
   });
   try {
     const result = await engine.run({ definition, profiles,
-      projectId: project.id, projectRoot: project.root, task: workflowTask });
+      projectId: project.id, projectRoot: project.root, task: workflowTask,
+      ...(conversationMemory === undefined ? {} : { conversationMemory }),
+      ...(Object.keys(initialProviderSessions).length === 0 ? {} : { providerSessions: initialProviderSessions }),
+      ...(Object.keys(initialProviderSessionMemoryRevisions).length === 0 ? {} : { providerSessionMemoryRevisions: initialProviderSessionMemoryRevisions }) });
+    const nextMemory = buildConversationMemory(conversationMemory, result.context, task, conversation.id);
+    persistence?.saveConversationMemory(nextMemory);
+    for (const profile of profiles) {
+      const providerSessionId = result.context.providerSessions[profile.id];
+      if (providerSessionId === undefined) continue;
+      persistence?.saveSessionLane({ conversationId: conversation.id, laneKey: profileSessionLaneKey(profile), agentId: profile.agentId,
+        providerSessionId, memoryRevision: result.context.providerSessionMemoryRevisions[profile.id] ?? 0, updatedAt: nextMemory.updatedAt });
+    }
     if (result.run.summary !== undefined) persistence?.saveMessage({ id: randomUUID(), conversationId: conversation.id,
       role: "assistant", content: result.run.summary, createdAt: new Date().toISOString() });
     return { conversation, workflowRunId: result.run.id, workflowStatus: result.run.status };
@@ -228,7 +286,7 @@ async function runChatWorkflow(project: Project, task: string, workflowTask = ta
     if (workflowRunId !== undefined) activeChatRuns.delete(workflowRunId);
     if (workflowRunId !== undefined) workflowConversationIds.delete(workflowRunId);
     await routerClient.shutdown();
-    for (const sessionId of ownedRouterSessionIds) routerSessionIds.delete(sessionId);
+    for (const sessionId of ownedRouterSessionIds) { routerSessionIds.delete(sessionId); routerSessionConversations.delete(sessionId); }
   }
 }
 
@@ -434,13 +492,16 @@ function registerIpc(): void {
     if (request.conversationId !== undefined
       && (existingConversation === undefined || existingConversation.projectId !== project.id)) throw new Error("Unknown conversation");
     const priorMessages = existingConversation === undefined ? [] : persistence?.listMessages(existingConversation.id) ?? [];
+    const conversationMemory = existingConversation === undefined ? undefined : persistence?.getConversationMemory(existingConversation.id);
     const attachments = takeAttachments(request.attachmentIds);
     const effectiveText = taskWithAttachments(request.text, attachments);
-    const contextualText = taskWithConversationHistory(effectiveText, priorMessages);
+    // Existing structured memory is already bounded and provider-neutral. Only conversations created before the
+    // memory table existed use one legacy transcript bootstrap; subsequent turns never replay the raw chat.
+    const contextualText = conversationMemory === undefined ? taskWithConversationHistory(effectiveText, priorMessages) : effectiveText;
     // Auto is the multi-agent path: the router picks the implementing role and decides after each stage whether the
     // work still needs a review or documentation. An explicit provider choice stays a single run below.
     if (request.agentId === "auto" && process.env.WAING_E2E !== "1") {
-      return runChatWorkflow(project, request.text, contextualText, existingConversation);
+      return runChatWorkflow(project, request.text, contextualText, existingConversation, conversationMemory);
     }
     const now = new Date().toISOString();
     const conversation: AppConversation = existingConversation === undefined
