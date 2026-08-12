@@ -37,6 +37,23 @@ describe("agent persistence", () => {
     expect(legacy.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='agent_profiles'").get()).toBeDefined();
     legacy.close();
   });
+  it("removes obsolete Responses API continuation state during upgrade", () => {
+    const legacy = new DatabaseSync(":memory:");
+    legacy.exec(`CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL);
+      INSERT INTO schema_migrations VALUES (1, 'initial_application_schema', '2026-07-27T00:00:00.000Z');
+      INSERT INTO schema_migrations VALUES (2, 'replace_fixed_roles_with_agent_profiles', '2026-07-27T00:00:00.000Z');
+      INSERT INTO schema_migrations VALUES (3, 'conversation_memory_session_lanes_and_usage', '2026-07-27T00:00:00.000Z');
+      INSERT INTO schema_migrations VALUES (4, 'codex_responses_continuations', '2026-07-27T00:00:00.000Z');
+      CREATE TABLE conversations (id TEXT PRIMARY KEY);
+      INSERT INTO conversations VALUES ('conversation');
+      CREATE TABLE codex_response_chains (conversation_id TEXT PRIMARY KEY, response_id TEXT, memory_revision INTEGER NOT NULL,
+        status TEXT NOT NULL, updated_at TEXT NOT NULL);
+      INSERT INTO codex_response_chains VALUES ('conversation', 'resp-old', 2, 'ready', '2026-07-27T00:00:00.000Z');`);
+    new MigrationRunner(legacy, ":memory:", migrations).run();
+    expect(legacy.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='codex_conversations'").get()).toBeUndefined();
+    expect(legacy.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='codex_response_chains'").get()).toBeUndefined();
+    legacy.close();
+  });
   it("saves, orders, and removes agent profiles", () => {
     database = new SqliteDatabase(":memory:"); const store = new PersistenceStore(database);
     store.saveAgentProfile(profile); store.saveAgentProfile({ ...profile, id: "planner", name: "Planner", position: 1 });
@@ -54,8 +71,9 @@ describe("agent persistence", () => {
     database = new SqliteDatabase(":memory:"); const store = new PersistenceStore(database);
     const now = new Date().toISOString();
     const project: Project = { id: "project", name: "Project", root: "/tmp/project" };
-    const conversation: AppConversation = { id: "conversation", projectId: project.id, title: "Task", createdAt: now, updatedAt: now };
+    const conversation: AppConversation = { id: "conversation", projectId: project.id, title: "Task", orchestrationMode: "codex", createdAt: now, updatedAt: now };
     store.saveProject({ ...project, realPath: project.root, createdAt: now, lastOpenedAt: now }); store.saveConversation(conversation);
+    expect(store.getConversation(conversation.id)).toMatchObject({ orchestrationMode: "codex" });
     const memory: ConversationMemory = { conversationId: conversation.id, version: 1, revision: 1, objective: "Ship the task",
       requirements: [], constraints: [], planItems: [], decisions: ["Use the existing adapter"], completedWork: ["Inspected the project"],
       changedFiles: ["src/index.ts"], openQuestions: [], unresolvedIssues: [], stepSummaries: [], updatedAt: now };

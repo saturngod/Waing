@@ -723,7 +723,7 @@ At startup:
 2. determine supported integration mode
 3. run a lightweight compatibility check
 4. create effective capabilities
-5. show warnings if a provider version is outside tested ranges
+5. keep tested-range results as diagnostic metadata and show users only actionable startup or protocol failures
 
 ---
 
@@ -4810,13 +4810,27 @@ Codex should maintain this section rather than inventing another progress file u
 - [x] Phase 13 — Reliability + Compatibility
 - [ ] Phase 14 — Packaging + Beta
 
+### Codex orchestration mode (validated in the current worktree)
+
+- [x] Per-conversation `Multi Agent` / `Codex` execution-mode selector, shown before routing configuration and persisted with the conversation.
+- [x] Routing settings are conditional: Multi Agent exposes provider/model/effort, while Codex exposes only Codex model/effort for the router and every workflow profile.
+- [x] Codex mode routes the router and every workflow role through the local Codex app-server with per-role model and effort targets; it does not require an OpenAI API key.
+- [x] Codex mode persists one app-server thread ID per Waing conversation and resumes it sequentially across router and role turns, regardless of model/effort changes.
+- [x] Once that shared Codex thread exists, router checkpoints and role prompts omit repeated transcript, memory, diff, and handoff history.
+- [x] Migration cleanup for the previously prototyped Responses API state, full `npm run check`, and Electron smoke coverage.
+- [x] Provider discovery failures are isolated so an unavailable CLI cannot break Settings or the provider roster.
+- [x] Codex discovery validates every PATH and macOS desktop-bundle candidate, skipping stale package-manager shims before model discovery or app-server startup.
+- [x] Codex tested-range metadata is not shown as a provider error; Settings displays only actionable discovery, startup, and protocol failures.
+
+Live API credentials and signed distribution remain intentionally outside this validation pass and stay part of Phase 14.
+
 ### Current phase
 
 `Phase 14 — Packaging + Beta`
 
 ### Last validated commit
 
-`No Git repository; Phase 0 validated in current worktree on July 27, 2026`
+`No Git repository; Codex orchestration mode validated in the current worktree on August 12, 2026`
 
 ### Known blockers
 
@@ -4824,7 +4838,7 @@ Codex should maintain this section rather than inventing another progress file u
 
 ### Architecture deviations
 
-`None recorded`
+`Codex mode is an explicit app-server-only routing path alongside the existing provider-neutral Multi Agent path.`
 
 ---
 

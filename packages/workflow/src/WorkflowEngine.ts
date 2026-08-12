@@ -15,6 +15,10 @@ import { WorkflowValidator } from "./WorkflowValidator";
 
 export interface WorkflowRouter { decideNext(input: RouterCheckpointInput): Promise<unknown> }
 export interface RouterLoopPolicy { maxRouterDecisions: number; maxSameActionWithoutStateChange: number; onExhausted: "ask_user" | "fail_workflow" }
+export interface WorkflowEngineOptions {
+  /** Sequential router and role turns share one provider thread that already contains prior outputs. */
+  providerThreadCarriesContext?: () => boolean;
+}
 export interface WorkflowStartInput {
   definition: WorkflowDefinition;
   profiles: AgentProfile[];
@@ -37,7 +41,8 @@ export class WorkflowEngine {
   constructor(private readonly repository: WorkflowRepository, private readonly executor: WorkflowStepExecutor,
     private readonly router: WorkflowRouter, readonly events = new WorkflowEventBus(), private readonly validator = new WorkflowValidator(),
     private readonly routerPolicy: RouterLoopPolicy = { maxRouterDecisions: 20, maxSameActionWithoutStateChange: 2, onExhausted: "ask_user" },
-    private readonly compaction: CompactionBudget = DEFAULT_COMPACTION_BUDGET) {}
+    private readonly compaction: CompactionBudget = DEFAULT_COMPACTION_BUDGET,
+    private readonly options: WorkflowEngineOptions = {}) {}
 
   async run(input: WorkflowStartInput): Promise<{ run: WorkflowRun; context: WorkflowContext }> {
     const definition = this.validator.validate(input.definition, input.profiles);
@@ -106,12 +111,16 @@ export class WorkflowEngine {
   private async executeRouter(definition: WorkflowDefinition, node: Extract<WorkflowNode, { type: "router" }>, context: WorkflowContext,
     roster: AgentProfile[], profiles: ProfileResolver, store: ContextStore, run: WorkflowRun): Promise<string | undefined> {
     const reason = this.checkpointReason(node.checkpoint); this.events.publish({ type: "workflow.router.started", nodeId: node.id, checkpointReason: reason });
-    const latest = context.stepResults.at(-1); const history = compactHistory(context.stepResults, this.compaction, latest === undefined ? 0 : 1);
+    const providerHasContext = this.options.providerThreadCarriesContext?.() === true;
+    const latest = providerHasContext ? undefined : context.stepResults.at(-1);
+    const history = providerHasContext ? { summaries: [], changedFiles: [], omittedStepCount: 0 }
+      : compactHistory(context.stepResults, this.compaction, latest === undefined ? 0 : 1);
     const checkpoint = routerCheckpointInputSchema.parse({ checkpointReason: reason, originalUserTask: context.originalUserTask,
       ...(latest === undefined ? {} : { latestStepResult: withoutDiff(latest, this.compaction) }), priorStepSummaries: history.summaries,
       ...(history.omittedStepCount === 0 ? {} : { omittedStepCount: history.omittedStepCount }),
-      ...(this.hasSharedState(context) ? { sharedState: context.sharedState } : {}),
-      ...(context.conversationMemory === undefined ? {} : { conversationMemory: compactConversationMemory(context.conversationMemory) }),
+      ...(!providerHasContext && this.hasSharedState(context) ? { sharedState: context.sharedState } : {}),
+      ...(providerHasContext || context.conversationMemory === undefined
+        ? {} : { conversationMemory: compactConversationMemory(context.conversationMemory) }),
       availableAgents: roster.filter((profile) => profile.enabled).map(({ id, name, whereToUse }) => ({ id, name, whereToUse })),
       allowedActions: node.allowedActions });
     const decision = routerOrchestrationDecisionSchema.parse(await this.router.decideNext(checkpoint));
@@ -144,6 +153,8 @@ export class WorkflowEngine {
     if (repeats >= this.routerPolicy.maxSameActionWithoutStateChange) throw new AgentError("WORKFLOW_OSCILLATION", "Router repeated the same delegation without a workflow state change");
   }
   private handoff(context: WorkflowContext, node: Extract<WorkflowNode, { type: "role_task" }>, retained?: string): WorkflowHandoffPacket {
+    if (this.options.providerThreadCarriesContext?.() === true) return { originalTask: context.originalUserTask, currentGoal: node.label,
+      priorStepSummaries: [], unresolvedIssues: [], ...(retained === undefined ? {} : { providerSessionRetained: true }) };
     const carried = retained === undefined ? context.stepResults : context.stepResults.filter((result) => result.providerSessionId !== retained);
     const history = compactHistory(carried, this.compaction); const diff = compactDiff(this.latestDiff(context), this.compaction);
     const deliveredRevision = context.providerSessionMemoryRevisions[node.agentProfileId] ?? 0;

@@ -1,13 +1,36 @@
 import { useEffect, useMemo, useState } from "react";
-import type { AgentDescriptor, AgentModelDescriptor, EffortLevel } from "@waing/domain";
+import type { AgentDescriptor, AgentModelDescriptor, CodexExecutionTarget, EffortLevel } from "@waing/domain";
 
 export interface ProviderModelSelection { agentId: string; modelId?: string; effort?: EffortLevel }
+export const CODEX_MODEL_OPTIONS: ReadonlyArray<{ modelId: string; displayName: string }> = [
+  { modelId: "gpt-5.6-sol", displayName: "GPT-5.6 Sol" },
+  { modelId: "gpt-5.6-terra", displayName: "GPT-5.6 Terra" },
+  { modelId: "gpt-5.6-luna", displayName: "GPT-5.6 Luna" },
+];
+export const DEFAULT_CODEX_TARGET: CodexExecutionTarget = { modelId: "gpt-5.6-luna", effort: "medium" };
 const modelRequests = new Map<string, Promise<AgentModelDescriptor[]>>();
 export function loadAgentModels(agentId: string): Promise<AgentModelDescriptor[]> {
   const existing = modelRequests.get(agentId);
   if (existing !== undefined) return existing;
   const request = window.waing.agents.models(agentId).catch(() => []);
   modelRequests.set(agentId, request); return request;
+}
+
+export function CodexTargetFields({ label, value, onChange }: {
+  label: string; value?: CodexExecutionTarget; onChange: (value: CodexExecutionTarget) => void;
+}) {
+  const target = value ?? DEFAULT_CODEX_TARGET;
+  return <div className="provider-model-fields codex-target-fields">
+    <label><span>{label} model</span><select aria-label={`${label} model`} value={target.modelId}
+      onChange={(event) => onChange({ ...target, modelId: event.target.value })}>
+      {CODEX_MODEL_OPTIONS.map((model) => <option key={model.modelId} value={model.modelId}>{model.displayName}</option>)}
+    </select></label>
+    <label><span>{label} effort</span><select aria-label={`${label} effort`} value={target.effort}
+      onChange={(event) => onChange({ ...target, effort: event.target.value as EffortLevel })}>
+      {(["low", "medium", "high", "max"] as const).map((effort) => <option key={effort} value={effort}>
+        {effort.charAt(0).toLocaleUpperCase()}{effort.slice(1)}</option>)}
+    </select></label>
+  </div>;
 }
 
 export function ProviderModelFields({ label, value, agents, onChange }: {

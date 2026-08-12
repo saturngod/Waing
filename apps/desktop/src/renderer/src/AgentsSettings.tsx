@@ -1,13 +1,16 @@
 import { useMemo, useState } from "react";
 import { ArrowDown, ArrowUp, Plus } from "lucide-react";
-import type { AgentDescriptor, AgentProfile, RouterSettings } from "@waing/domain";
+import type { AgentDescriptor, AgentProfile, CodexExecutionTarget, OrchestrationMode, RouterSettings } from "@waing/domain";
 import type { ProviderModelSelection } from "./ModelPicker";
-import { ProviderModelFields } from "./ModelPicker";
+import { CodexTargetFields, DEFAULT_CODEX_TARGET, ProviderModelFields } from "./ModelPicker";
 
 const permissions = [["read_only", "Read only"], ["ask_before_changes", "Ask changes"], ["auto_edit", "Auto edit"], ["autonomous", "Autonomous"]];
 
-export function AgentsSettings({ profiles, router, agents, onProfilesChange, onRouterChange }: { profiles: AgentProfile[]; router: RouterSettings;
-  agents: AgentDescriptor[]; onProfilesChange: (profiles: AgentProfile[]) => void; onRouterChange: (router: RouterSettings) => void }) {
+export function AgentsSettings({ profiles, router, agents, mode, onModeChange, onProfilesChange, onRouterChange }: {
+  profiles: AgentProfile[]; router: RouterSettings; agents: AgentDescriptor[]; mode: OrchestrationMode;
+  onModeChange: (mode: OrchestrationMode) => void;
+  onProfilesChange: (profiles: AgentProfile[]) => void; onRouterChange: (router: RouterSettings) => void;
+}) {
   const [editing, setEditing] = useState<string>(); const [confirmDelete, setConfirmDelete] = useState<string>();
   const sorted = useMemo(() => [...profiles].sort((a, b) => a.position - b.position), [profiles]);
   function patch(id: string, update: Partial<AgentProfile>): void { onProfilesChange(profiles.map((profile) => profile.id === id ? { ...profile, ...update } : profile)); }
@@ -21,21 +24,36 @@ export function AgentsSettings({ profiles, router, agents, onProfilesChange, onR
       return next;
     }));
   }
+  function codexTarget(value: CodexExecutionTarget | undefined): CodexExecutionTarget { return value ?? DEFAULT_CODEX_TARGET; }
   function move(id: string, direction: -1 | 1): void { const items = [...sorted]; const from = items.findIndex((item) => item.id === id); const to = from + direction; if (from < 0 || to < 0 || to >= items.length) return;
     [items[from], items[to]] = [items[to]!, items[from]!]; onProfilesChange(items.map((item, position) => ({ ...item, position }))); }
   function create(): void { const base = "agent"; let id = base; let suffix = 2; while (profiles.some((profile) => profile.id === id)) id = `${base}-${suffix++}`;
     const profile: AgentProfile = { id, name: "New Agent", whereToUse: "Describe when the router should use this agent.", enabled: true,
-      agentId: agents.find((agent) => agent.available)?.id ?? agents[0]?.id ?? "codex", effort: "medium", permissionProfileId: "ask_before_changes", position: profiles.length };
+      agentId: agents.find((agent) => agent.available)?.id ?? agents[0]?.id ?? "codex", effort: "medium",
+      codex: DEFAULT_CODEX_TARGET, permissionProfileId: "ask_before_changes", position: profiles.length };
     onProfilesChange([...profiles, profile]); setEditing(id); }
   return <>
+    <div className="settings-card settings-rows routing-mode-card"><label><span><strong>Execution mode</strong>
+      <small>Choose how the router and roles run for this conversation.</small></span>
+      <select aria-label="Routing execution mode" value={mode} onChange={(event) => onModeChange(event.target.value as OrchestrationMode)}>
+        <option value="multi_agent">Multi Agent</option><option value="codex">Codex</option>
+      </select></label></div>
     <div className="settings-card router-card"><div className="router-card-heading"><strong>Router</strong><small>Chooses which agent handles the next step.</small></div>
-      <ProviderModelFields label="Router" value={{ agentId: router.agentId,
+      {mode === "multi_agent" ? <ProviderModelFields label="Router" value={{ agentId: router.agentId,
         ...(router.modelId === undefined ? {} : { modelId: router.modelId }),
-        ...(router.effort === undefined ? {} : { effort: router.effort }) }} agents={agents} onChange={onRouterChange} /></div>
+        ...(router.effort === undefined ? {} : { effort: router.effort }) }} agents={agents} onChange={(selection) => {
+          const next: RouterSettings = { ...router, agentId: selection.agentId };
+          if (selection.modelId === undefined) delete next.modelId; else next.modelId = selection.modelId;
+          if (selection.effort === undefined) delete next.effort; else next.effort = selection.effort;
+          onRouterChange(next);
+        }} /> : <CodexTargetFields label="Router" {...(router.codex === undefined ? {} : { value: router.codex })}
+        onChange={(codex) => onRouterChange({ ...router, codex })} />}</div>
     <div className="settings-section-heading agent-list-heading"><h3>Agents</h3><button className="primary" type="button" onClick={create}><Plus size={14}/> New agent</button></div>
     <div className="agent-list">{sorted.map((profile, index) => <div className="agent-row" key={profile.id}>
-      <div><strong>{profile.name}</strong><small>{profile.whereToUse}</small></div><span>{profile.modelId ?? "Provider default"} · {agents.find((agent) => agent.id === profile.agentId)?.displayName ?? profile.agentId}</span>
-      <span>{profile.effort ?? "Default"}</span><span>{permissions.find(([id]) => id === profile.permissionProfileId)?.[1] ?? "Ask changes"}</span>
+      <div><strong>{profile.name}</strong><small>{profile.whereToUse}</small></div>
+      {mode === "multi_agent" ? <><span>{profile.modelId ?? "Provider default"} · {agents.find((agent) => agent.id === profile.agentId)?.displayName ?? profile.agentId}</span>
+        <span>{profile.effort ?? "Default"}</span></> : <><span>{codexTarget(profile.codex).modelId}</span><span>{codexTarget(profile.codex).effort}</span></>}
+      <span>{permissions.find(([id]) => id === profile.permissionProfileId)?.[1] ?? "Ask changes"}</span>
       <div className="agent-actions"><button type="button" aria-label={`Move ${profile.name} up`} disabled={index === 0} onClick={() => move(profile.id, -1)}><ArrowUp size={13}/></button>
         <button type="button" aria-label={`Move ${profile.name} down`} disabled={index === sorted.length - 1} onClick={() => move(profile.id, 1)}><ArrowDown size={13}/></button>
         <button type="button" onClick={() => setEditing(editing === profile.id ? undefined : profile.id)}>Edit</button>
@@ -45,9 +63,11 @@ export function AgentsSettings({ profiles, router, agents, onProfilesChange, onR
         <label>Name<input maxLength={40} value={profile.name} onChange={(event) => patch(profile.id, { name: event.target.value })}/></label>
         <label>Where to use<input maxLength={200} value={profile.whereToUse} onChange={(event) => patch(profile.id, { whereToUse: event.target.value })}/><small>This is the only text the router reads. Keep it one line. {profile.whereToUse.length}/200</small></label>
         <label>Instructions<textarea maxLength={4000} rows={4} value={profile.instructions ?? ""} onChange={(event) => patch(profile.id, { instructions: event.target.value || undefined })}/></label>
-        <ProviderModelFields label={profile.name} value={{ agentId: profile.agentId,
+        {mode === "multi_agent" ? <ProviderModelFields label={profile.name} value={{ agentId: profile.agentId,
           ...(profile.modelId === undefined ? {} : { modelId: profile.modelId }),
           ...(profile.effort === undefined ? {} : { effort: profile.effort }) }} agents={agents} onChange={(selection) => replaceExecution(profile.id, selection)} />
+          : <CodexTargetFields label="Codex" {...(profile.codex === undefined ? {} : { value: profile.codex })}
+            onChange={(codex) => patch(profile.id, { codex })} />}
         <label>Permission<select value={profile.permissionProfileId ?? "ask_before_changes"} onChange={(event) => patch(profile.id, { permissionProfileId: event.target.value })}>{permissions.map(([id, text]) => <option key={id} value={id}>{text}</option>)}</select></label>
         <label className="agent-enabled"><input type="checkbox" checked={profile.enabled} onChange={(event) => patch(profile.id, { enabled: event.target.checked })}/> Enabled</label>
       </div>}

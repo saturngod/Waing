@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Activity, ArrowLeft, Bot, Search, Server, Settings2 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import type { AgentDescriptor, AgentProfile, RouterSettings } from "@waing/domain";
+import type { AgentDescriptor, AgentProfile, OrchestrationMode, RouterSettings } from "@waing/domain";
 import { AgentsSettings } from "./AgentsSettings";
 import { PROVIDER_STATUS_HINT, providerDotState, providerStatusLabel } from "./providerStatus";
 
@@ -15,9 +15,12 @@ const SETTINGS_SECTIONS: Array<{ id: SettingsSection; label: string; icon: Lucid
   { id: "diagnostics", label: "Diagnostics", icon: Activity, keywords: "events logs export troubleshooting" },
 ];
 
-export function SettingsPanel({ agents, eventCount, theme, onThemeChange, onRolesSaved, onBack }: {
+export function SettingsPanel({ agents, eventCount, theme, orchestrationMode, onThemeChange, onOrchestrationModeChange,
+  onRolesSaved, onBack }: {
   agents: AgentDescriptor[]; eventCount: number; theme: "system" | "dark" | "light";
+  orchestrationMode: OrchestrationMode;
   onThemeChange: (theme: "system" | "dark" | "light") => void;
+  onOrchestrationModeChange: (mode: OrchestrationMode) => void;
   onRolesSaved: (needsReview: boolean) => void; onBack: () => void;
 }) {
   const [section, setSection] = useState<SettingsSection>("general");
@@ -92,7 +95,8 @@ export function SettingsPanel({ agents, eventCount, theme, onThemeChange, onRole
         <div className="settings-section routing-settings"><div className="settings-section-heading"><h3>Routing</h3>
           <span className="settings-save-status" role="status" aria-live="polite">{saving ? "Saving…" : ""}</span></div>
           {profiles.length === 0 || router === undefined ? <p>Loading agents…</p> : <AgentsSettings profiles={profiles} router={router}
-            agents={agents} onProfilesChange={updateProfiles} onRouterChange={updateRouter} />}
+            agents={agents} mode={orchestrationMode} onModeChange={onOrchestrationModeChange}
+            onProfilesChange={updateProfiles} onRouterChange={updateRouter} />}
           {error !== undefined && <div className="settings-save-error" role="alert"><p>{error}</p>
             {dirty && <button type="button" onClick={() => setSaveAttempt((attempt) => attempt + 1)}>Retry</button>}</div>}
         </div></>}

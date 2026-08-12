@@ -6,7 +6,10 @@ export interface ProviderCompatibility {
 }
 
 const manifests: Record<string, { testedRange: string; accepts(version: number[]): boolean }> = {
-  codex: { testedRange: "0.145.x", accepts: ([major, minor]) => major === 0 && minor === 145 },
+  codex: {
+    testedRange: "0.145.x–0.147.x",
+    accepts: ([major, minor]) => major === 0 && minor !== undefined && minor >= 145 && minor <= 147,
+  },
   claude: { testedRange: "0.3.x SDK", accepts: ([major, minor]) => major === 0 && minor === 3 },
   antigravity: { testedRange: "1.1.x", accepts: ([major, minor]) => major === 1 && minor === 1 },
   opencode: { testedRange: "1.x", accepts: ([major]) => major === 1 },

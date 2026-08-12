@@ -1,5 +1,5 @@
 import type { AgentDescriptor, AgentProfile, AgentQuestionResponse, AgentEvent, AgentModelDescriptor, AgentSession, AppConversation, EffortLevel, PermissionDecision, Project, RouterSettings, StepAnnouncement, WorkflowEvent, WorkspaceFileMatches } from "@waing/domain";
-import { agentProfileSchema, agentQuestionResponseSchema, routerSettingsSchema } from "@waing/domain";
+import { agentProfileSchema, agentQuestionResponseSchema, orchestrationModeSchema, routerSettingsSchema } from "@waing/domain";
 import { z } from "zod";
 
 export { IPC_CHANNELS } from "./channels";
@@ -34,7 +34,7 @@ export const openLinkInputSchema = z.object({ target: z.string().min(1).max(4_09
 export const sessionSendInputSchema = z.object({ projectId: z.string().min(1), text: z.string().min(1),
   conversationId: z.string().min(1).optional(),
   attachmentIds: z.array(z.string().uuid()).max(10).optional(),
-  agentId: z.string().min(1), model: z.string().min(1).optional(), mode: z.enum(["execute", "plan", "review", "investigate"]),
+  agentId: z.string().min(1), orchestrationMode: orchestrationModeSchema.optional(), model: z.string().min(1).optional(), mode: z.enum(["execute", "plan", "review", "investigate"]),
   effort: z.enum(["low", "medium", "high", "max"]).optional() });
 export const sessionCancelInputSchema = z.object({ sessionId: z.string().min(1) });
 /**

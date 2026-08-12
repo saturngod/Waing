@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AgentManager } from "@waing/agent-core";
 import { AgentError } from "@waing/domain";
-import type { AgentEvent, EffortLevel } from "@waing/domain";
+import type { AgentEvent, AgentSession, EffortLevel } from "@waing/domain";
 import { parseRouterJson } from "./parseRouterJson";
 import type { RouterClient } from "./RouterManager";
 
@@ -13,6 +13,10 @@ export interface AgentRouterClientOptions {
   projectRoot: string;
   model?: string;
   effort?: EffortLevel;
+  /** Stable app conversation id used when this router shares a provider thread with workflow roles. */
+  conversationId?: string;
+  /** Reads and updates a provider thread that must be resumed across sequential router and role turns. */
+  sharedProviderSession?: { get(): string | undefined; set(providerSessionId: string): void };
   /** Called with each routing session id so the host can keep router chatter out of the chat transcript. */
   onSession?: (sessionId: string) => void;
 }
@@ -31,8 +35,15 @@ export class AgentRouterClient implements RouterClient {
   async classify(prompt: string): Promise<unknown> {
     const agent = this.options.agents.registry.get(this.options.agentId);
     const { capabilities } = await agent.discover();
-    const session = await this.options.agents.startSession(this.options.agentId, {
-      conversationId: `router-${randomUUID()}`, projectId: this.options.projectId, projectRoot: this.options.projectRoot });
+    const start = { conversationId: this.options.conversationId ?? `router-${randomUUID()}`,
+      projectId: this.options.projectId, projectRoot: this.options.projectRoot };
+    const retained = this.options.sharedProviderSession?.get();
+    let session: AgentSession;
+    if (retained !== undefined && capabilities.persistentSessions) {
+      try { session = await this.options.agents.resumeSession(this.options.agentId, { ...start, providerSessionId: retained }); }
+      catch { session = await this.options.agents.startSession(this.options.agentId, start); }
+    } else session = await this.options.agents.startSession(this.options.agentId, start);
+    if (session.providerSessionId !== undefined) this.options.sharedProviderSession?.set(session.providerSessionId);
     this.sessionIds.add(session.id);
     this.options.onSession?.(session.id);
     let text = "";

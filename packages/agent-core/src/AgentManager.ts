@@ -28,7 +28,10 @@ export class AgentManager {
   ) {}
 
   async discoverAll(): Promise<AgentDescriptor[]> {
-    return Promise.all(this.registry.list().map((agent) => agent.discover()));
+    return Promise.all(this.registry.list().map(async (agent) => {
+      try { return await agent.discover(); }
+      catch (cause) { return unavailableDescriptor(agent.id, cause); }
+    }));
   }
 
   async startSession(agentId: string, input: StartSessionInput,
@@ -129,4 +132,22 @@ export class AgentManager {
     })().finally(() => this.pumps.delete(sessionId));
     this.pumps.set(sessionId, pump);
   }
+}
+
+const EMPTY_CAPABILITIES: AgentDescriptor["capabilities"] = {
+  streaming: false, persistentSessions: false, cancellation: false, concurrentRuns: false,
+  nativeStructuredOutput: false, planMode: false, effortControl: false, interactivePermissions: false,
+  diffEvents: false, shellEvents: false, fileEvents: false, modelSelection: false, mcp: false,
+  customTools: false, additionalDirectories: false,
+};
+
+function unavailableDescriptor(agentId: string, cause: unknown): AgentDescriptor {
+  const missing = cause instanceof AgentError && cause.code === "NOT_INSTALLED";
+  const reason = cause instanceof Error ? cause.message : "Provider discovery failed";
+  const displayNames: Record<string, string> = {
+    codex: "Codex", claude: "Claude Code", antigravity: "Antigravity", opencode: "OpenCode",
+  };
+  return { id: agentId, displayName: displayNames[agentId] ?? agentId, installed: !missing, available: false,
+    capabilities: EMPTY_CAPABILITIES, authState: missing ? "missing" : "error",
+    warnings: [`Provider discovery failed: ${reason}`] };
 }

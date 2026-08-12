@@ -13,6 +13,12 @@ import { renderPacket } from "./ContextCompactor";
 const STATE_FENCE = "waing-state";
 
 export interface ResolvedProfileDisplay { agentDisplayName: string; modelDisplayName?: string }
+export interface AgentStepExecutorOptions {
+  /** One persistent provider thread shared by sequential roles in a provider-specific orchestration mode. */
+  sharedProviderSession?: { get(): string | undefined; set(providerSessionId: string): void };
+  /** The shared provider thread already contains prior turns, so only role instructions and the new goal are sent. */
+  providerThreadCarriesContext?: boolean;
+}
 export interface StepExecutionInput {
   stepRunId: string;
   node: Exclude<WorkflowNode, { type: "router" | "loop" | "complete" }>;
@@ -33,7 +39,7 @@ export interface WorkflowStepExecutor {
 
 export class AgentStepExecutor implements WorkflowStepExecutor {
   private activeSessionId?: string;
-  constructor(private readonly agents: AgentManager) {}
+  constructor(private readonly agents: AgentManager, private readonly options: AgentStepExecutorOptions = {}) {}
 
   async describe(profile: AgentProfile): Promise<ResolvedProfileDisplay> {
     const agent = this.agents.registry.get(profile.agentId);
@@ -49,6 +55,7 @@ export class AgentStepExecutor implements WorkflowStepExecutor {
     workflowHandoffPacketSchema.parse(input.handoff);
     if (input.signal.aborted) throw new AgentError("CANCELLED", "Workflow step cancelled");
     const session = await this.openSession(input);
+    if (session.providerSessionId !== undefined) this.options.sharedProviderSession?.set(session.providerSessionId);
     this.activeSessionId = session.id;
     const events: AgentEvent[] = [];
     let settle: ((event: AgentEvent) => void) | undefined;
@@ -87,12 +94,13 @@ export class AgentStepExecutor implements WorkflowStepExecutor {
     // The role's saved permission profile travels with the session, so approvals this step raises are answered
     // by the rule the user set for that role rather than prompting for every one of them.
     const permissions = resolvePermissionProfile(input.profile.permissionProfileId);
-    if (input.resumeProviderSessionId !== undefined) {
+    const retained = this.options.sharedProviderSession?.get() ?? input.resumeProviderSessionId;
+    if (retained !== undefined) {
       const { capabilities } = await this.agents.registry.get(input.profile.agentId).discover();
       if (capabilities.persistentSessions) {
         try {
           return await this.agents.resumeSession(input.profile.agentId,
-            { ...start, providerSessionId: input.resumeProviderSessionId }, permissions);
+            { ...start, providerSessionId: retained }, permissions);
         } catch { /* The provider forgot the session; a fresh one with the full packet is still correct. */ }
       }
     }
@@ -119,7 +127,9 @@ export class AgentStepExecutor implements WorkflowStepExecutor {
    */
   private prompt(input: StepExecutionInput): string {
     const sections = [input.profile.instructions, "instructions" in input.node ? input.node.instructions : undefined,
-      renderPacket("Provider-neutral workflow handoff", input.handoff)].filter((value): value is string => value !== undefined);
+      this.options.providerThreadCarriesContext ? `Current goal: ${input.handoff.currentGoal}`
+        : renderPacket("Provider-neutral workflow handoff", input.handoff)]
+      .filter((value): value is string => value !== undefined);
     if (input.handoff.changedFiles !== undefined && input.handoff.currentDiff === undefined) sections.push(
       "Read the changed files listed above from the workspace; the diff is not reproduced here.");
     // Amending the shared state costs a few dozen tokens and spares every later step from re-deriving the plan out of

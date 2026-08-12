@@ -42,6 +42,9 @@ describe("secret redaction", () => {
 
 describe("compatibility and restart policy", () => {
   it("reports versions outside the provider compatibility manifest", () => {
+    expect(providerCompatibility("codex", "0.147.0")).toMatchObject({
+      compatible: true, testedRange: "0.145.x–0.147.x",
+    });
     expect(providerCompatibility("opencode", "1.18.5")).toMatchObject({ compatible: true, testedRange: "1.x" });
     const incompatible = providerCompatibility("opencode", "2.0.0");
     expect(incompatible.compatible).toBe(false); expect(incompatible.warning).toContain("2.0.0");

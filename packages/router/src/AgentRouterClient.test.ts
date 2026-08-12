@@ -17,6 +17,7 @@ const capabilities = (overrides: Partial<AgentCapabilities> = {}): AgentCapabili
 class RoutingAgent implements CodingAgent {
   readonly requests: AgentRequest[] = [];
   readonly closed: string[] = [];
+  readonly resumed: string[] = [];
   private readonly queues = new Map<string, AsyncQueue<AgentEvent>>();
   private sequence = 0;
   constructor(readonly id: string, private readonly reply: string, private readonly caps = capabilities()) {}
@@ -33,7 +34,10 @@ class RoutingAgent implements CodingAgent {
     this.queues.set(session.id, new AsyncQueue());
     return Promise.resolve(session);
   }
-  resumeSession(input: ResumeSessionInput): Promise<AgentSession> { return this.startSession(input); }
+  async resumeSession(input: ResumeSessionInput): Promise<AgentSession> {
+    this.resumed.push(input.providerSessionId);
+    return { ...await this.startSession(input), providerSessionId: input.providerSessionId };
+  }
   send(sessionId: string, request: AgentRequest): Promise<AgentRun> {
     this.requests.push(request);
     const run = { id: randomUUID(), sessionId, startedAt: new Date().toISOString() };
@@ -80,6 +84,18 @@ describe("AgentRouterClient", () => {
       projectRoot: "/tmp", model: "gpt-5-codex", effort: "high" });
     await expect(client.classify("classify")).resolves.toEqual({ action: "review" });
     expect(agent.requests[0]).toMatchObject({ mode: "plan", model: "gpt-5-codex", effort: "high" });
+  });
+
+  it("resumes and updates a provider thread shared with workflow roles", async () => {
+    const agent = new RoutingAgent("codex", '{"action":"complete"}', capabilities({ persistentSessions: true }));
+    let providerSessionId: string | undefined = "thread-1";
+    const client = new AgentRouterClient({ agents: manager(agent), agentId: "codex", projectId: "p", projectRoot: "/tmp",
+      conversationId: "conversation-1", sharedProviderSession: {
+        get: () => providerSessionId, set: (next) => { providerSessionId = next; },
+      } });
+    await expect(client.classify("classify")).resolves.toEqual({ action: "complete" });
+    expect(agent.resumed).toEqual(["thread-1"]);
+    expect(providerSessionId).toBe("thread-1");
   });
 
   it("reports non-JSON answers as a retryable router error", async () => {

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, Clock, CornerDownLeft, FileText, Folder, FolderOpen, Image, MoreHorizontal, PanelLeft, PanelRight,
   Paperclip, Plus, Settings, SquarePen, Trash2, X } from "lucide-react";
 import type { AppInfo, AttachmentChoice, ConversationHistory } from "@waing/ipc-contracts";
-import type { AgentDescriptor, AgentEvent, AgentQuestion, AgentQuestionResponse, AppConversation, PermissionRequest,
+import type { AgentDescriptor, AgentEvent, AgentQuestion, AgentQuestionResponse, AppConversation, OrchestrationMode, PermissionRequest,
   Project, StepAnnouncement, WorkflowSharedState } from "@waing/domain";
 import { ActivityTimeline } from "./ActivityTimeline";
 import type { TimelineStep } from "./ActivityTimeline";
@@ -16,11 +16,17 @@ type View = "chat" | "settings";
 type ThemePreference = "system" | "dark" | "light";
 
 const THEME_STORAGE_KEY = "waing.theme";
+const ORCHESTRATION_MODE_STORAGE_KEY = "waing.orchestration-mode";
 function savedTheme(): ThemePreference {
   try {
     const value = window.localStorage.getItem(THEME_STORAGE_KEY);
     return value === "dark" || value === "light" || value === "system" ? value : "system";
   } catch { return "system"; }
+}
+function savedOrchestrationMode(): OrchestrationMode {
+  try {
+    return window.localStorage.getItem(ORCHESTRATION_MODE_STORAGE_KEY) === "codex" ? "codex" : "multi_agent";
+  } catch { return "multi_agent"; }
 }
 
 const tokenFormat = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 });
@@ -28,7 +34,7 @@ const compactTokens = (value: number): string => tokenFormat.format(value);
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 type HistoryMessage = { id: string; role: "user" | "assistant"; content: string };
 /** A composed message with nowhere to run yet: either sent immediately, or held until the project's run ends. */
-type QueuedMessage = { id: string; text: string; attachments: AttachmentChoice[] };
+type QueuedMessage = { id: string; text: string; attachments: AttachmentChoice[]; orchestrationMode: OrchestrationMode };
 
 function visibleHistoryMessages(messages: ConversationHistory["messages"]): HistoryMessage[] {
   return messages.flatMap((message, index) => message.role === "user" || message.role === "assistant"
@@ -61,6 +67,7 @@ export function App() {
   const [events, setEvents] = useState<AgentEvent[]>([]);
   const [agents, setAgents] = useState<AgentDescriptor[]>([]);
   const [task, setTask] = useState("");
+  const [orchestrationMode, setOrchestrationMode] = useState<OrchestrationMode>(savedOrchestrationMode);
   const [attachments, setAttachments] = useState<AttachmentChoice[]>([]);
   const [attachmentDragActive, setAttachmentDragActive] = useState(false);
   const [queuedByProject, setQueuedByProject] = useState<Record<string, QueuedMessage[]>>({});
@@ -89,9 +96,15 @@ export function App() {
   const selectedProjectIdRef = useRef<string | undefined>(undefined);
   const workflowProjectRef = useRef(new Map<string, string>());
   const pendingTaskTitleRef = useRef(new Map<string, string>());
+  const pendingTaskModeRef = useRef(new Map<string, OrchestrationMode>());
   const sendBusy = project !== null && runningProjectIds.has(project.id);
   const composerDraft = task.trim().length > 0 || attachments.length > 0;
   const queued = project === null ? [] : queuedByProject[project.id] ?? [];
+
+  function changeOrchestrationMode(next: OrchestrationMode): void {
+    setOrchestrationMode(next);
+    try { window.localStorage.setItem(ORCHESTRATION_MODE_STORAGE_KEY, next); } catch { /* preference stays session-local */ }
+  }
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -148,7 +161,8 @@ export function App() {
         setActiveRunByProject((current) => ({ ...current, [event.projectId]: event.workflowRunId }));
         const now = new Date().toISOString();
         const runningConversation: AppConversation = { id: event.conversationId, projectId: event.projectId,
-          title: pendingTaskTitleRef.current.get(event.projectId) ?? "Running task", createdAt: now, updatedAt: now };
+          title: pendingTaskTitleRef.current.get(event.projectId) ?? "Running task",
+          orchestrationMode: pendingTaskModeRef.current.get(event.projectId) ?? "multi_agent", createdAt: now, updatedAt: now };
         setConversationsByProject((current) => ({ ...current, [event.projectId]: [runningConversation,
           ...(current[event.projectId] ?? []).filter((item) => item.id !== event.conversationId)] }));
         if (event.projectId === selectedProjectIdRef.current) {
@@ -293,6 +307,7 @@ export function App() {
     setQuestion(questionsByProject[nextProject.id]);
     setActiveStep(activeStepByProject[nextProject.id]);
     setProject(nextProject);
+    setOrchestrationMode(savedOrchestrationMode());
   }
 
   async function chooseProject(): Promise<Project | null> {
@@ -405,6 +420,9 @@ export function App() {
       // The plan belongs to the run that produced it; a replayed conversation carries no state events to rebuild one.
       if (project !== null) setSharedStateByProject((current) => { const next = { ...current }; delete next[project.id]; return next; });
       setOpenConversationId(conversationId);
+      const nextMode = history.conversation.orchestrationMode ?? savedOrchestrationMode();
+      setOrchestrationMode(nextMode);
+      try { window.localStorage.setItem(ORCHESTRATION_MODE_STORAGE_KEY, nextMode); } catch { /* preference stays session-local */ }
       setHistoryMessages(visibleHistoryMessages(history.messages));
       const replay = history.events.filter((event) => event.type !== "permission.requested"
         && event.type !== "message.delta" && event.type !== "message.completed");
@@ -430,7 +448,7 @@ export function App() {
   /** Send now when the project is idle; otherwise hold the message and let the run that owns the project finish. */
   async function sendTask(): Promise<void> {
     if (project === null || !composerDraft) return;
-    const message: QueuedMessage = { id: crypto.randomUUID(), text: task.trim(), attachments };
+    const message: QueuedMessage = { id: crypto.randomUUID(), text: task.trim(), attachments, orchestrationMode };
     setTask(""); setAttachments([]);
     if (runningProjectIds.has(project.id)) {
       setQueuedByProject((current) => ({ ...current, [project.id]: [...(current[project.id] ?? []), message] }));
@@ -445,6 +463,8 @@ export function App() {
   async function runTask(target: Project, message: QueuedMessage): Promise<void> {
     const text = message.text.length === 0 ? "Please review the attached files." : message.text;
     const selectedAttachments = message.attachments;
+    setOrchestrationMode(message.orchestrationMode);
+    try { window.localStorage.setItem(ORCHESTRATION_MODE_STORAGE_KEY, message.orchestrationMode); } catch { /* preference stays session-local */ }
     const continuingConversationId = openConversationId;
     if (continuingConversationId !== undefined) {
       try {
@@ -456,14 +476,15 @@ export function App() {
     setRunningProjectIds((current) => new Set(current).add(target.id));
     pendingTaskTitleRef.current.set(target.id,
       conversations.find((conversation) => conversation.id === continuingConversationId)?.title ?? text.slice(0, 80));
+    pendingTaskModeRef.current.set(target.id, message.orchestrationMode);
     setPrompt(text); setResolvedAgentId(undefined);
     setResolvedModel(undefined); setResolvedEffort(undefined);
     setWorkflowSteps([]); setAgentMeta({}); setActiveStep(undefined); setActiveSessionId(undefined);
     // Routing happens inside the send call, so the step is shown as running until the reply names the routed role.
     setRouterStep("running");
     try {
-      // Always Auto: the router picks the role, and that role's saved profile supplies provider, model, and effort.
-      const result = await window.waing.sessions.send({ projectId: target.id, text, agentId: "auto", mode: "execute",
+      const result = await window.waing.sessions.send({ projectId: target.id, text, agentId: "auto",
+        orchestrationMode: message.orchestrationMode, mode: "execute",
         ...(continuingConversationId === undefined ? {} : { conversationId: continuingConversationId }),
         ...(selectedAttachments.length === 0 ? {} : { attachmentIds: selectedAttachments.map((item) => item.id) }) });
       if (result.session !== undefined) setActiveSessionId(result.session.id);
@@ -476,12 +497,14 @@ export function App() {
         setRunningProjectIds((current) => { const next = new Set(current); next.delete(target.id); return next; });
       }
       pendingTaskTitleRef.current.delete(target.id);
+      pendingTaskModeRef.current.delete(target.id);
       setConversations((current) => [result.conversation, ...current.filter((item) => item.id !== result.conversation.id)]);
       setConversationsByProject((current) => ({ ...current,
         [target.id]: [result.conversation, ...(current[target.id] ?? []).filter((item) => item.id !== result.conversation.id)] }));
     } catch (reason) {
       setRunningProjectIds((current) => { const next = new Set(current); next.delete(target.id); return next; });
       pendingTaskTitleRef.current.delete(target.id);
+      pendingTaskModeRef.current.delete(target.id);
       setPrompt(undefined); setTask(message.text); setAttachments(selectedAttachments);
       setRouterStep((current) => current === "running" ? "failed" : "idle");
       reportError(reason);
@@ -590,7 +613,7 @@ export function App() {
                 <PanelLeft size={18} aria-hidden="true" /></button>}
               <div><p className="eyebrow">Agent workspace</p><h2>{project?.name ?? "No project selected"}</h2></div></div>
             : <div><p className="eyebrow">Applies to every project</p><h2>Settings</h2></div>}
-          {/* No per-send agent/model/mode pickers: routing always decides, and Settings owns each role's provider. */}
+          {/* The mode applies to this conversation; provider/model choices stay in Settings. */}
           {/* A run keeps going while Settings is open, so its state and Stop stay reachable from here. */}
           {view === "settings" && <div className="run-strip">
             {permission !== undefined && <>
@@ -628,7 +651,8 @@ export function App() {
           followRef.current = node.scrollHeight - node.scrollTop - node.clientHeight < 80;
         }}>
           {view === "settings" ? <SettingsPanel agents={agents} eventCount={events.length}
-            theme={theme} onThemeChange={setTheme}
+            theme={theme} orchestrationMode={orchestrationMode} onThemeChange={setTheme}
+            onOrchestrationModeChange={changeOrchestrationMode}
             onRolesSaved={(needsReview) => setRoutingNeedsReview(needsReview)} onBack={() => setView("chat")} /> :
             <><ActivityTimeline events={events} steps={steps} agentMeta={agentMeta} historyMessages={historyMessages}
               {...(project === null ? {} : { projectId: project.id })} {...(prompt === undefined ? {} : { prompt })}
@@ -684,7 +708,12 @@ export function App() {
             }} />
             <div><div className="composer-context"><button className="attach-button" type="button" aria-label="Attach files and images"
               title="Attach files and images" onClick={() => void chooseAttachments()}><Paperclip size={16} /></button>
-              <span>{project?.root ?? "Choose a project to begin"}</span></div><div className="composer-actions">
+              <span>{project?.root ?? "Choose a project to begin"}</span>
+              <label className="orchestration-picker"><span className="sr-only">Execution mode</span>
+                <select aria-label="Execution mode" value={orchestrationMode} disabled={sendBusy}
+                  onChange={(event) => changeOrchestrationMode(event.target.value as OrchestrationMode)}>
+                  <option value="multi_agent">Multi Agent</option><option value="codex">Codex</option>
+                </select></label></div><div className="composer-actions">
               {/* Stop stays reachable for the whole run: queueing a follow-up must never be the reason the user
                   can no longer halt the work they are watching. Send sits beside it and queues the draft. */}
               {sendBusy && <button className="stop" type="button" onClick={() => void cancelRun()}>Stop</button>}

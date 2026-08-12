@@ -16,7 +16,6 @@ export interface PersistedSessionLane { conversationId: string; laneKey: string;
 export interface PersistedUsageRecord { id: string; conversationId?: string; workflowRunId?: string; sessionId: string; runId: string;
   scope: "router" | "worker" | "direct"; agentId: string; modelId?: string; inputTokens: number; outputTokens: number;
   cachedInputTokens?: number; createdAt: string }
-
 export class PersistenceStore {
   constructor(private readonly database: SqliteDatabase) {}
 
@@ -64,16 +63,16 @@ export class PersistenceStore {
     }
   }
   saveConversation(conversation: AppConversation): void {
-    this.database.connection.prepare(`INSERT INTO conversations(id,project_id,title,created_at,updated_at) VALUES(?,?,?,?,?)
-      ON CONFLICT(id) DO UPDATE SET title=excluded.title,updated_at=excluded.updated_at`).run(conversation.id, conversation.projectId,
-      conversation.title, conversation.createdAt, conversation.updatedAt);
+    this.database.connection.prepare(`INSERT INTO conversations(id,project_id,title,orchestration_mode,created_at,updated_at) VALUES(?,?,?,?,?,?)
+      ON CONFLICT(id) DO UPDATE SET title=excluded.title,orchestration_mode=excluded.orchestration_mode,updated_at=excluded.updated_at`).run(conversation.id, conversation.projectId,
+      conversation.title, conversation.orchestrationMode ?? "multi_agent", conversation.createdAt, conversation.updatedAt);
   }
   listConversations(projectId: string): AppConversation[] {
-    return this.database.connection.prepare("SELECT id,project_id AS projectId,title,created_at AS createdAt,updated_at AS updatedAt FROM conversations WHERE project_id=? ORDER BY updated_at DESC")
+    return this.database.connection.prepare("SELECT id,project_id AS projectId,title,orchestration_mode AS orchestrationMode,created_at AS createdAt,updated_at AS updatedAt FROM conversations WHERE project_id=? ORDER BY updated_at DESC")
       .all(projectId) as unknown as AppConversation[];
   }
   getConversation(conversationId: string): AppConversation | undefined {
-    return this.database.connection.prepare("SELECT id,project_id AS projectId,title,created_at AS createdAt,updated_at AS updatedAt FROM conversations WHERE id=?")
+    return this.database.connection.prepare("SELECT id,project_id AS projectId,title,orchestration_mode AS orchestrationMode,created_at AS createdAt,updated_at AS updatedAt FROM conversations WHERE id=?")
       .get(conversationId) as unknown as AppConversation | undefined;
   }
   removeConversation(conversationId: string): void {

@@ -14,5 +14,7 @@ describe("starter agents", () => {
     expect(profiles.map((profile) => profile.name)).toEqual(["Planner", "Coder", "Architect", "Reviewer", "Doc Writer"]);
     expect(profiles.every((profile) => ["codex", "claude"].includes(profile.agentId))).toBe(true);
   });
-  it("prefers OpenCode for the router", () => expect(buildDefaultRouterSettings([descriptor("codex"), descriptor("opencode")])).toEqual({ agentId: "opencode", effort: "low" }));
+  it("prefers OpenCode for the router and seeds a Codex target", () => expect(buildDefaultRouterSettings([descriptor("codex"), descriptor("opencode")])).toEqual({
+    agentId: "opencode", effort: "low", codex: { modelId: "gpt-5.6-luna", effort: "medium" },
+  }));
 });

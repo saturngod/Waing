@@ -106,4 +106,49 @@ CREATE TABLE usage_records (
 CREATE INDEX idx_session_lanes_conversation ON provider_session_lanes(conversation_id, updated_at);
 CREATE INDEX idx_usage_conversation ON usage_records(conversation_id, created_at);
 `,
+}, {
+  version: 4,
+  name: "codex_responses_continuations",
+  sql: `
+CREATE TABLE IF NOT EXISTS conversations (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), title TEXT NOT NULL,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+ALTER TABLE conversations ADD COLUMN orchestration_mode TEXT NOT NULL DEFAULT 'multi_agent';
+CREATE TABLE codex_response_chains (
+  conversation_id TEXT PRIMARY KEY REFERENCES conversations(id),
+  response_id TEXT,
+  memory_revision INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'ready',
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX idx_codex_response_chains_status ON codex_response_chains(status, updated_at);
+`,
+}, {
+  version: 5,
+  name: "codex_conversations_api",
+  sql: `
+CREATE TABLE codex_conversations (
+  conversation_id TEXT PRIMARY KEY REFERENCES conversations(id),
+  provider_conversation_id TEXT,
+  memory_revision INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'ready',
+  updated_at TEXT NOT NULL
+);
+INSERT INTO codex_conversations(conversation_id,provider_conversation_id,memory_revision,status,updated_at)
+  SELECT conversation_id,NULL,memory_revision,
+    CASE WHEN response_id IS NULL THEN status ELSE 'stale' END,
+    updated_at
+  FROM codex_response_chains;
+DROP TABLE codex_response_chains;
+CREATE INDEX idx_codex_conversations_status ON codex_conversations(status, updated_at);
+`,
+}, {
+  version: 6,
+  name: "remove_responses_api_continuation_state",
+  destructive: true,
+  sql: `
+DROP INDEX IF EXISTS idx_codex_conversations_status;
+DROP TABLE IF EXISTS codex_conversations;
+DROP INDEX IF EXISTS idx_codex_response_chains_status;
+DROP TABLE IF EXISTS codex_response_chains;
+`,
 }];

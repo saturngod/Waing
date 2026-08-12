@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { orchestrationModeSchema } from "./agents";
 
 export const projectSchema = z.object({
   id: z.string().min(1),
@@ -11,6 +12,7 @@ export const appConversationSchema = z.object({
   id: z.string().min(1),
   projectId: z.string().min(1),
   title: z.string().min(1),
+  orchestrationMode: orchestrationModeSchema.optional(),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
 });

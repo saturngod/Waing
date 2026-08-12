@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { AgentProfile, ConversationMemory, WorkflowStepResult } from "@waing/domain";
+import type { AgentProfile, ConversationMemory, RouterCheckpointInput, WorkflowStepResult } from "@waing/domain";
 import { InMemoryWorkflowRepository } from "./WorkflowRepository";
 import { WorkflowCompiler } from "./WorkflowCompiler";
 import { WorkflowEngine } from "./WorkflowEngine";
@@ -46,5 +46,26 @@ describe("adaptive agent workflow", () => {
         projectId: "p", projectRoot: "/tmp", task: "follow up", conversationMemory: memory,
         providerSessions: { "agent-0": "thread" }, providerSessionMemoryRevisions: { "agent-0": 1 } });
     expect(executor.calls[0]?.handoff.conversationMemory?.revision).toBe(2);
+  });
+
+  it("bootstraps a new shared provider thread once, then omits repeated history", async () => {
+    const profiles = [profile(0)]; const executor = new Executor(); const checkpoints: RouterCheckpointInput[] = [];
+    const memory: ConversationMemory = { conversationId: "conversation", version: 1, revision: 2, objective: "Build it", requirements: [],
+      constraints: [], planItems: [], decisions: [], completedWork: ["Earlier work"], changedFiles: [], openQuestions: [], unresolvedIssues: [],
+      stepSummaries: [], updatedAt: "2026-08-12T00:00:00.000Z" };
+    const decisions = [{ action: "delegate", agentProfileId: "agent-0", statusIntent: { activity: "implementing" }, rationale: "code", confidence: 1 },
+      { action: "complete", statusIntent: { activity: "implementing" }, rationale: "done", confidence: 1 }];
+    let providerHasContext = false;
+    const engine = new WorkflowEngine(new InMemoryWorkflowRepository(), executor, { decideNext: (input) => {
+      checkpoints.push(input); providerHasContext = true; return Promise.resolve(decisions.shift());
+    } }, undefined, undefined, undefined, undefined, { providerThreadCarriesContext: () => providerHasContext });
+    await engine.run({ definition: new WorkflowCompiler().compileAdaptive(profiles), profiles,
+      projectId: "p", projectRoot: "/tmp", task: "follow up", conversationMemory: memory });
+    expect(checkpoints[0]?.conversationMemory?.revision).toBe(2);
+    expect(executor.calls[0]?.handoff).toMatchObject({ priorStepSummaries: [], unresolvedIssues: [] });
+    expect(executor.calls[0]?.handoff.conversationMemory).toBeUndefined();
+    expect(checkpoints[1]).toMatchObject({ priorStepSummaries: [] });
+    expect(checkpoints[1]?.latestStepResult).toBeUndefined();
+    expect(checkpoints[1]?.conversationMemory).toBeUndefined();
   });
 });

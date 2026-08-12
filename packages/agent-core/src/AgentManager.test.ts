@@ -11,7 +11,7 @@ import type {
   ResumeSessionInput,
   StartSessionInput,
 } from "@waing/domain";
-import { AgentCapabilityError } from "@waing/domain";
+import { AgentCapabilityError, AgentError } from "@waing/domain";
 import { AgentManager } from "./AgentManager";
 import { AsyncQueue } from "./AsyncQueue";
 import type { CodingAgent } from "./CodingAgent";
@@ -110,6 +110,13 @@ class StackingAgent extends FakeAgent {
   }
 }
 
+class BrokenDiscoveryAgent extends FakeAgent {
+  override readonly id = "broken";
+  override discover(): Promise<AgentDescriptor> {
+    return Promise.reject(new AgentError("PROCESS_FAILED", "Child process exited with 1", this.id, true));
+  }
+}
+
 describe("AgentManager", () => {
   it("registers a fake adapter and forwards its stream to a UI consumer", async () => {
     const manager = new AgentManager();
@@ -134,6 +141,15 @@ describe("AgentManager", () => {
       "run.started", "message.delta", "run.completed",
     ]);
     expect(manager.sessions.get(session.id).status).toBe("completed");
+    await manager.shutdown();
+  });
+
+  it("keeps one provider discovery failure from breaking the provider roster", async () => {
+    const manager = new AgentManager(); manager.registry.register(new BrokenDiscoveryAgent());
+    await expect(manager.discoverAll()).resolves.toMatchObject([{
+      id: "broken", installed: true, available: false, authState: "error",
+      warnings: ["Provider discovery failed: Child process exited with 1"],
+    }]);
     await manager.shutdown();
   });
 

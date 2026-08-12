@@ -41,6 +41,12 @@ test("launches a sandboxed renderer with the typed preload bridge", async () => 
     await page.getByRole("button", { name: "New task" }).click();
     await expect(page.getByLabel("Message")).toBeFocused();
     await expect(page.getByRole("button", { name: "Attach files and images" })).toBeVisible();
+    const executionMode = page.getByRole("combobox", { name: "Execution mode" });
+    await expect(executionMode).toHaveValue("multi_agent");
+    await expect(executionMode.locator("option")).toHaveText(["Multi Agent", "Codex"]);
+    await executionMode.selectOption("codex");
+    expect(await page.evaluate(() => window.localStorage.getItem("waing.orchestration-mode"))).toBe("codex");
+    await executionMode.selectOption("multi_agent");
     await page.getByLabel("Message").evaluate((textarea) => {
       const transfer = new DataTransfer();
       transfer.items.add(new File([new Uint8Array([137, 80, 78, 71])], "clipboard.png", { type: "image/png" }));
@@ -168,6 +174,14 @@ test("launches a sandboxed renderer with the typed preload bridge", async () => 
     await expect(page.getByRole("heading", { name: "Agents", level: 2 })).toBeVisible();
     await expect(page.getByText("Planner", { exact: true })).toBeVisible();
     await expect(page.getByText("Coder", { exact: true })).toBeVisible();
+    const routingMode = page.getByRole("combobox", { name: "Routing execution mode" });
+    await expect(routingMode).toHaveValue("multi_agent");
+    await routingMode.selectOption("codex");
+    await expect(page.getByRole("combobox", { name: "Router provider" })).toHaveCount(0);
+    await expect(page.getByRole("combobox", { name: "Router model" }).locator("option"))
+      .toHaveText(["GPT-5.6 Sol", "GPT-5.6 Terra", "GPT-5.6 Luna"]);
+    expect(await page.evaluate(() => window.localStorage.getItem("waing.orchestration-mode"))).toBe("codex");
+    await routingMode.selectOption("multi_agent");
     const agentHeaderGap = await page.evaluate(() => {
       const button = document.querySelector<HTMLElement>(".agent-list-heading .primary")!;
       const list = document.querySelector<HTMLElement>(".agent-list")!;
@@ -185,6 +199,8 @@ test("launches a sandboxed renderer with the typed preload bridge", async () => 
     await expect(page.locator('input[value="New Agent"]')).toBeVisible();
     await page.getByRole("button", { name: "Providers" }).click();
     await expect(page.getByText("Provider status", { exact: true })).toBeVisible();
+    await expect(page.getByText("Codex (Responses API)", { exact: true })).toHaveCount(0);
+    await expect(page.getByText("OpenAI API key", { exact: false })).toHaveCount(0);
     await page.getByRole("button", { name: "Diagnostics" }).click();
     await expect(page.getByRole("heading", { name: "Diagnostics", exact: true })).toBeVisible();
     // Settings takes the full page: no run inspector, no chat composer, and the run state moves into the topbar.

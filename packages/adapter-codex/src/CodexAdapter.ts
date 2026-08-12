@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import {
-  AsyncQueue, JsonRpcTransport, ProcessSupervisor, probeVersion, providerCompatibility, resolveExecutable,
+  AsyncQueue, JsonRpcTransport, ProcessSupervisor, probeVersion, resolveExecutables,
 } from "@waing/agent-core";
 import type { CodingAgent, ManagedProcess } from "@waing/agent-core";
 import { AgentError } from "@waing/domain";
@@ -64,6 +66,8 @@ const stringValue = (value: unknown, fallback = ""): string =>
 
 export interface CodexAdapterOptions {
   executable?: string;
+  /** Overrides PATH for deterministic discovery tests and embedded desktop environments. */
+  searchPath?: string;
   supervisor?: ProcessSupervisor;
   transportFactory?: () => Promise<{ transport: JsonRpcTransport; process?: ManagedProcess }>;
 }
@@ -79,6 +83,7 @@ export class CodexAdapter implements CodingAgent {
   private process?: ManagedProcess;
   private resolvedExecutable?: string;
   private version?: string;
+  private versionProbeWarning?: string;
 
   constructor(private readonly options: CodexAdapterOptions = {}) {
     this.supervisor = options.supervisor ?? new ProcessSupervisor();
@@ -87,11 +92,11 @@ export class CodexAdapter implements CodingAgent {
 
   async discover(): Promise<AgentDescriptor> {
     try {
-      this.resolvedExecutable ??= await resolveExecutable(this.executable);
-      this.version ??= (await probeVersion(this.supervisor, this.resolvedExecutable)).replace(/^codex-cli\s+/, "");
+      if (this.resolvedExecutable === undefined) await this.resolveWorkingExecutable();
       return { id: this.id, displayName: "Codex", installed: true, available: true,
-        version: this.version, executablePath: this.resolvedExecutable, capabilities: this.capabilities(),
-        authState: "unknown", warnings: this.compatibilityWarnings(this.version) };
+        ...(this.version === undefined ? {} : { version: this.version }), executablePath: this.resolvedExecutable,
+        capabilities: this.capabilities(), authState: "unknown",
+        warnings: this.versionProbeWarning === undefined ? [] : [this.versionProbeWarning] };
     } catch (error) {
       if (error instanceof AgentError && error.code === "NOT_INSTALLED") {
         return { id: this.id, displayName: "Codex", installed: false, available: false,
@@ -99,6 +104,35 @@ export class CodexAdapter implements CodingAgent {
       }
       throw error;
     }
+  }
+
+  /** A broken package-manager shim must not hide the native Codex bundled with the desktop app later in PATH. */
+  private async resolveWorkingExecutable(): Promise<void> {
+    const candidates = await resolveExecutables(this.executable, this.options.searchPath ?? process.env.PATH ?? "",
+      this.executable === "codex" ? this.desktopCandidates() : []);
+    let firstFailure: unknown;
+    for (const candidate of candidates) {
+      try {
+        const version = (await probeVersion(this.supervisor, candidate)).replace(/^codex-cli\s+/, "");
+        await probeVersion(this.supervisor, candidate, ["app-server", "--help"]);
+        this.resolvedExecutable = candidate; this.version = version;
+        return;
+      } catch (error) { firstFailure ??= error; }
+    }
+    // Preserve the old best-effort behavior for unusual builds whose app-server works but help/version probes do not.
+    this.resolvedExecutable = candidates[0]!;
+    const reason = firstFailure instanceof Error ? firstFailure.message : "unknown error";
+    this.versionProbeWarning = `Could not validate a Codex app-server executable; startup will still be attempted: ${reason}`;
+  }
+
+  private desktopCandidates(): string[] {
+    if (process.platform !== "darwin") return [];
+    return [
+      "/Applications/Codex.app/Contents/Resources/codex",
+      "/Applications/ChatGPT.app/Contents/Resources/codex",
+      join(homedir(), "Applications/Codex.app/Contents/Resources/codex"),
+      join(homedir(), "Applications/ChatGPT.app/Contents/Resources/codex"),
+    ];
   }
 
   async listModels(): Promise<AgentModelDescriptor[]> {
@@ -431,8 +465,4 @@ export class CodexAdapter implements CodingAgent {
       customTools: false, additionalDirectories: true };
   }
 
-  private compatibilityWarnings(version: string): string[] {
-    const result = providerCompatibility(this.id, version);
-    return result.warning === undefined ? [] : [result.warning];
-  }
 }

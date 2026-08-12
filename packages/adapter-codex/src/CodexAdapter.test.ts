@@ -1,3 +1,6 @@
+import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { JsonRpcTransport, ProcessSupervisor } from "@waing/agent-core";
 import type { AgentEvent } from "@waing/domain";
@@ -222,5 +225,51 @@ describe("CodexAdapter", () => {
   it("reports a missing executable without throwing discovery errors", async () => {
     const adapter = new CodexAdapter({ executable: "/definitely/missing/codex" });
     await expect(adapter.discover()).resolves.toMatchObject({ installed: false, available: false });
+  });
+
+  it.skipIf(process.platform === "win32")("does not expose internal tested-range warnings to users", async () => {
+    const root = await mkdtemp(join(tmpdir(), "waing-codex-version-warning-"));
+    const executable = join(root, "codex");
+    await writeFile(executable, `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "codex-cli 0.999.0"; exit 0; fi
+if [ "$1" = "app-server" ] && [ "$2" = "--help" ]; then echo "app-server help"; exit 0; fi
+exit 1
+`);
+    await chmod(executable, 0o755);
+    const adapter = new CodexAdapter({ executable });
+    try {
+      await expect(adapter.discover()).resolves.toMatchObject({
+        available: true, version: "0.999.0", warnings: [],
+      });
+    } finally { await adapter.shutdown(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  it.skipIf(process.platform === "win32")("keeps app-server discovery usable when the version probe fails", async () => {
+    const adapter = new CodexAdapter({ executable: "/usr/bin/false" });
+    await expect(adapter.discover()).resolves.toMatchObject({
+      installed: true, available: true,
+      warnings: [expect.stringContaining("startup will still be attempted")],
+    });
+    await adapter.shutdown();
+  });
+
+  it.skipIf(process.platform === "win32")("skips a broken PATH shim and selects a working app-server", async () => {
+    const root = await mkdtemp(join(tmpdir(), "waing-codex-discovery-"));
+    const brokenDirectory = join(root, "broken"); const workingDirectory = join(root, "working");
+    const broken = join(brokenDirectory, "codex"); const working = join(workingDirectory, "codex");
+    await mkdir(brokenDirectory); await mkdir(workingDirectory);
+    await writeFile(broken, "#!/bin/sh\nexit 1\n");
+    await writeFile(working, `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "codex-cli 0.145.0"; exit 0; fi
+if [ "$1" = "app-server" ] && [ "$2" = "--help" ]; then echo "app-server help"; exit 0; fi
+exit 1
+`);
+    await chmod(broken, 0o755); await chmod(working, 0o755);
+    const adapter = new CodexAdapter({ searchPath: `${brokenDirectory}${delimiter}${workingDirectory}` });
+    try {
+      await expect(adapter.discover()).resolves.toMatchObject({
+        installed: true, available: true, version: "0.145.0", executablePath: await realpath(working), warnings: [],
+      });
+    } finally { await adapter.shutdown(); await rm(root, { recursive: true, force: true }); }
   });
 });

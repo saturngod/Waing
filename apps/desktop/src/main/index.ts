@@ -10,7 +10,7 @@ import { AntigravityAdapter } from "@waing/adapter-antigravity";
 import { OpenCodeAdapter } from "@waing/adapter-opencode";
 import { AgentRouterClient, OpenCodeRouterClient, RouterManager } from "@waing/router";
 import type { RouterClient } from "@waing/router";
-import { AgentStepExecutor, InMemoryWorkflowRepository, WorkflowCompiler,
+import { AgentStepExecutor, DEFAULT_COMPACTION_BUDGET, InMemoryWorkflowRepository, WorkflowCompiler,
   WorkflowEngine, WorkflowEventBus, WorkflowValidator, buildConversationMemory, buildDefaultRouterSettings,
   buildStarterAgentProfiles, profileSessionLaneKey, sortAgentProfiles } from "@waing/workflow";
 import { PersistenceStore, SqliteDatabase, SqliteWorkflowRepository } from "@waing/persistence";
@@ -21,7 +21,6 @@ import type { AgentSettingsView, AttachmentChoice, ConversationHistory, SessionS
 import { conversationMemorySchema } from "@waing/domain";
 import type { AgentDescriptor, AgentEvent, AgentProfile, AgentRequest, AppConversation, ConversationMemory, Project, RouterSettings } from "@waing/domain";
 import { FakeAgent } from "./FakeAgent";
-import { SecretStore } from "./SecretStore";
 
 const projects = new Map<string, Project>();
 const agentManager = new AgentManager();
@@ -36,7 +35,6 @@ const trustedWebContents = new Set<number>();
 let database: SqliteDatabase | undefined;
 let persistence: PersistenceStore | undefined;
 let workflowRepository: SqliteWorkflowRepository | undefined;
-let secretStore: SecretStore | undefined;
 const activeChatRuns = new Map<string, WorkflowEngine>();
 /** Routing runs are internal: their events must not reach the transcript as if an agent were answering the user. */
 const routerSessionIds = new Set<string>();
@@ -96,11 +94,6 @@ function updateDirectConversationMemory(conversationId: string): void {
     updatedAt: new Date().toISOString(),
   }));
 }
-export function getSecretStore(): SecretStore {
-  if (secretStore === undefined) throw new Error("Secret storage is not initialized");
-  return secretStore;
-}
-
 function configureContentSecurityPolicy(electronSession: Electron.Session): void {
   if (contentSecurityPolicyConfigured) return;
   contentSecurityPolicyConfigured = true;
@@ -141,14 +134,21 @@ agentManager.eventBus.subscribe((event) => {
   const isRouterSession = routerSessionIds.has(event.sessionId);
   let session: ReturnType<typeof agentManager.sessions.get> | undefined;
   try { session = agentManager.sessions.get(event.sessionId); } catch { /* stale provider events are still safe to ignore */ }
+  const sessionConversationId = session?.conversationId;
+  const workflowEntry = sessionConversationId === undefined ? undefined
+    : [...workflowConversationIds.entries()].find(([workflowRunId, conversation]) =>
+      workflowRunId === sessionConversationId || conversation === sessionConversationId);
+  const workflowRunId = workflowEntry?.[0];
   const conversationId = session === undefined
     ? routerSessionConversations.get(event.sessionId)
-    : workflowConversationIds.get(session.conversationId) ?? session.conversationId;
-  const scope = isRouterSession ? "router" : session !== undefined && workflowConversationIds.has(session.conversationId) ? "worker" : "direct";
-  if (safeEvent.type === "usage.updated" && conversationId !== undefined) {
-    try { persistence?.saveUsageRecord({ event: safeEvent, scope,
+    : workflowEntry?.[1] ?? session.conversationId;
+  const scope = isRouterSession ? "router" : workflowEntry === undefined ? "direct" : "worker";
+  const scopedEvent = workflowRunId === undefined ? safeEvent : { ...safeEvent, workflowRunId };
+  const usageEvent = safeEvent.type === "usage.updated" ? { ...safeEvent, ...(workflowRunId === undefined ? {} : { workflowRunId }) } : undefined;
+  if (usageEvent !== undefined && conversationId !== undefined) {
+    try { persistence?.saveUsageRecord({ event: usageEvent, scope,
       ...(conversationId === undefined ? {} : { conversationId }),
-      ...(scope === "worker" && session !== undefined ? { workflowRunId: session.conversationId } : {}) }); }
+      ...(scope === "worker" && workflowRunId !== undefined ? { workflowRunId } : {}) }); }
     catch { /* usage is observational and must not strand a provider run */ }
   }
   if (isRouterSession || session === undefined || conversationId === undefined) return;
@@ -156,20 +156,20 @@ agentManager.eventBus.subscribe((event) => {
     persistence?.saveProviderSession({ id: session.id, conversationId, agentId: session.agentId,
       ...(session.providerSessionId === undefined ? {} : { providerSessionId: session.providerSessionId }),
       status: session.status, payload: session, updatedAt: session.updatedAt });
-    persistence?.saveSignificantEvent(conversationId, safeEvent);
-    if (safeEvent.type === "message.delta") {
-      assistantBuffers.set(session.id, `${assistantBuffers.get(session.id) ?? ""}${safeEvent.text}`);
-    } else if (safeEvent.type === "message.completed") {
-      assistantBuffers.set(session.id, safeEvent.text);
-    } else if (safeEvent.type === "run.completed") {
+    persistence?.saveSignificantEvent(conversationId, scopedEvent);
+    if (scopedEvent.type === "message.delta") {
+      assistantBuffers.set(session.id, `${assistantBuffers.get(session.id) ?? ""}${scopedEvent.text}`);
+    } else if (scopedEvent.type === "message.completed") {
+      assistantBuffers.set(session.id, scopedEvent.text);
+    } else if (scopedEvent.type === "run.completed") {
       const content = assistantBuffers.get(session.id);
       if (content !== undefined && content.length > 0) persistence?.saveMessage({ id: randomUUID(),
-        conversationId, role: "assistant", content, createdAt: safeEvent.timestamp });
+        conversationId, role: "assistant", content, createdAt: scopedEvent.timestamp });
       if (scope === "direct") updateDirectConversationMemory(conversationId);
       assistantBuffers.delete(session.id);
     }
   } catch { /* workflow/session setup can race the first normalized event */ }
-  for (const window of BrowserWindow.getAllWindows()) window.webContents.send(IPC_CHANNELS.sessionsEvent, safeEvent);
+  for (const window of BrowserWindow.getAllWindows()) window.webContents.send(IPC_CHANNELS.sessionsEvent, scopedEvent);
 });
 
 function assertTrustedIpc(event: Electron.IpcMainInvokeEvent): void {
@@ -178,6 +178,7 @@ function assertTrustedIpc(event: Electron.IpcMainInvokeEvent): void {
 
 const ROUTING_CONFIGURED_SETTING = "routing.configured";
 const ROUTING_ACKNOWLEDGED_SETTING = "routing.acknowledged";
+const CODEX_CONVERSATION_LANE = "codex-app-server-conversation-v1";
 
 /**
  * Role profiles are the single source of truth for which provider runs which role. Settings owns them; the first
@@ -202,7 +203,9 @@ async function resolveAgentProfiles(): Promise<AgentSettingsView> {
  * adapter. Passing a model that belongs to one provider to a different one is what made a non-OpenCode router hang.
  */
 function createRouterClient(profile: RouterSettings | undefined, project: Project,
-  onRouterSession?: (sessionId: string) => void): RouterClient & { shutdown(): Promise<void> } {
+  onRouterSession?: (sessionId: string) => void,
+  sharedCodexSession?: { conversationId: string; session: { get(): string | undefined; set(providerSessionId: string): void } },
+): RouterClient & { shutdown(): Promise<void> } {
   const model = profile?.modelId;
   // "default" is a placeholder some model lists expose; it must never be forwarded as a real model id.
   const usableModel = model === undefined || model === "default" ? undefined : model;
@@ -212,6 +215,8 @@ function createRouterClient(profile: RouterSettings | undefined, project: Projec
   return new AgentRouterClient({ agents: agentManager, agentId: profile.agentId, projectId: project.id,
     projectRoot: project.root, ...(usableModel === undefined ? {} : { model: usableModel }),
     ...(profile.effort === undefined ? {} : { effort: profile.effort }),
+    ...(sharedCodexSession === undefined ? {} : { conversationId: sharedCodexSession.conversationId,
+      sharedProviderSession: sharedCodexSession.session }),
     onSession: (sessionId) => { routerSessionIds.add(sessionId); onRouterSession?.(sessionId); } });
 }
 
@@ -229,7 +234,8 @@ async function runChatWorkflow(project: Project, task: string, workflowTask = ta
   await repository.saveDefinition(definition);
   const title = existingConversation?.title ?? task.slice(0, 80);
   let conversation: AppConversation = existingConversation ?? { id: randomUUID(), projectId: project.id, title,
-    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+    orchestrationMode: "multi_agent", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+  conversation = { ...conversation, orchestrationMode: "multi_agent" };
   const initialProviderSessions = Object.fromEntries(profiles.filter((profile) => profile.enabled).flatMap((profile) => {
     const lane = persistence?.getSessionLane(conversation.id, profileSessionLaneKey(profile));
     return lane === undefined ? [] : [[profile.id, lane.providerSessionId] as const];
@@ -287,6 +293,66 @@ async function runChatWorkflow(project: Project, task: string, workflowTask = ta
     if (workflowRunId !== undefined) workflowConversationIds.delete(workflowRunId);
     await routerClient.shutdown();
     for (const sessionId of ownedRouterSessionIds) { routerSessionIds.delete(sessionId); routerSessionConversations.delete(sessionId); }
+  }
+}
+
+/** Runs the adaptive workflow using Codex's local app-server for the router and every role. */
+async function runCodexWorkflow(project: Project, task: string, workflowTask = task,
+  existingConversation?: AppConversation, conversationMemory?: ConversationMemory): Promise<SessionSendResult> {
+  const { profiles, router } = await resolveAgentProfiles();
+  const codexProfiles = profiles.map((profile) => ({ ...profile, agentId: "codex",
+    modelId: profile.codex?.modelId ?? "gpt-5.6-luna", effort: profile.codex?.effort ?? "medium" }));
+  await assertAgentsUsable(codexProfiles);
+  const definition = new WorkflowCompiler().compileAdaptive(codexProfiles);
+  const repository = workflowRepository ?? new InMemoryWorkflowRepository();
+  await repository.saveDefinition(definition);
+  const title = existingConversation?.title ?? task.slice(0, 80);
+  let conversation: AppConversation = existingConversation ?? { id: randomUUID(), projectId: project.id, title,
+    orchestrationMode: "codex", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+  conversation = { ...conversation, orchestrationMode: "codex" };
+  let codexProviderSessionId = persistence?.getSessionLane(conversation.id, CODEX_CONVERSATION_LANE)?.providerSessionId;
+  const sharedProviderSession = { get: (): string | undefined => codexProviderSessionId,
+    set: (providerSessionId: string): void => { codexProviderSessionId = providerSessionId; } };
+  const routerProfile: RouterSettings = { agentId: "codex", modelId: router.codex?.modelId ?? "gpt-5.6-luna",
+    effort: router.codex?.effort ?? "medium" };
+  const ownedRouterSessionIds = new Set<string>();
+  const routerClient = createRouterClient(routerProfile, project, (sessionId) => {
+    ownedRouterSessionIds.add(sessionId); routerSessionConversations.set(sessionId, conversation.id);
+  }, { conversationId: conversation.id, session: sharedProviderSession });
+  const engine = new WorkflowEngine(repository, new AgentStepExecutor(agentManager,
+    { sharedProviderSession, providerThreadCarriesContext: true }),
+    new RouterManager(routerClient, ROUTER_TIMEOUT_MS), new WorkflowEventBus(), new WorkflowValidator(),
+    { maxRouterDecisions: 20, maxSameActionWithoutStateChange: 2, onExhausted: "ask_user" },
+    DEFAULT_COMPACTION_BUDGET, { providerThreadCarriesContext: () => sharedProviderSession.get() !== undefined });
+  let workflowRunId: string | undefined;
+  const unsubscribe = engine.events.subscribe((event) => {
+    if (event.type === "workflow.started") {
+      const now = new Date().toISOString(); conversation = { ...conversation, updatedAt: now };
+      persistence?.saveConversation(conversation); persistence?.saveMessage({ id: randomUUID(), conversationId: conversation.id,
+        role: "user", content: task, createdAt: now }); workflowRunId = event.workflowRunId;
+      workflowConversationIds.set(event.workflowRunId, conversation.id); activeChatRuns.set(event.workflowRunId, engine);
+    }
+    const runId = event.type === "workflow.started" ? event.workflowRunId : workflowRunId;
+    if (runId !== undefined) {
+      const desktopEvent = { ...event, workflowRunId: runId, projectId: project.id, conversationId: conversation.id };
+      for (const window of BrowserWindow.getAllWindows()) window.webContents.send(IPC_CHANNELS.workflowsEvent, desktopEvent);
+    }
+  });
+  try {
+    const result = await engine.run({ definition, profiles: codexProfiles, projectId: project.id, projectRoot: project.root,
+      task: workflowTask, ...(conversationMemory === undefined ? {} : { conversationMemory }) });
+    const nextMemory = buildConversationMemory(conversationMemory, result.context, task, conversation.id);
+    persistence?.saveConversationMemory(nextMemory);
+    if (codexProviderSessionId !== undefined) persistence?.saveSessionLane({ conversationId: conversation.id,
+      laneKey: CODEX_CONVERSATION_LANE, agentId: "codex", providerSessionId: codexProviderSessionId,
+      memoryRevision: nextMemory.revision, updatedAt: nextMemory.updatedAt });
+    if (result.run.summary !== undefined) persistence?.saveMessage({ id: randomUUID(), conversationId: conversation.id,
+      role: "assistant", content: result.run.summary, createdAt: new Date().toISOString() });
+    return { conversation, workflowRunId: result.run.id, workflowStatus: result.run.status };
+  } finally {
+    unsubscribe(); if (workflowRunId !== undefined) activeChatRuns.delete(workflowRunId);
+    if (workflowRunId !== undefined) workflowConversationIds.delete(workflowRunId);
+    await routerClient.shutdown(); for (const sessionId of ownedRouterSessionIds) { routerSessionIds.delete(sessionId); routerSessionConversations.delete(sessionId); }
   }
 }
 
@@ -486,6 +552,7 @@ function registerIpc(): void {
   ipcMain.handle(IPC_CHANNELS.sessionsSend, async (event, input: unknown) => {
     assertTrustedIpc(event);
     const request = sessionSendInputSchema.parse(input);
+    const orchestrationMode = request.orchestrationMode ?? "multi_agent";
     const project = projects.get(request.projectId);
     if (project === undefined) throw new Error("Choose a project before sending a task");
     const existingConversation = request.conversationId === undefined ? undefined : persistence?.getConversation(request.conversationId);
@@ -500,13 +567,20 @@ function registerIpc(): void {
     const contextualText = conversationMemory === undefined ? taskWithConversationHistory(effectiveText, priorMessages) : effectiveText;
     // Auto is the multi-agent path: the router picks the implementing role and decides after each stage whether the
     // work still needs a review or documentation. An explicit provider choice stays a single run below.
+    if (orchestrationMode === "codex" && process.env.WAING_E2E !== "1") {
+      // A pre-memory conversation gets one bounded legacy bootstrap; subsequent Codex turns resume the single
+      // app-server thread persisted for this conversation and receive only the new task text when memory is present.
+      return runCodexWorkflow(project, request.text, conversationMemory === undefined ? contextualText : effectiveText,
+        existingConversation, conversationMemory);
+    }
     if (request.agentId === "auto" && process.env.WAING_E2E !== "1") {
       return runChatWorkflow(project, request.text, contextualText, existingConversation, conversationMemory);
     }
     const now = new Date().toISOString();
     const conversation: AppConversation = existingConversation === undefined
-      ? { id: randomUUID(), projectId: project.id, title: request.text.slice(0, 80), createdAt: now, updatedAt: now }
-      : { ...existingConversation, updatedAt: now };
+      ? { id: randomUUID(), projectId: project.id, title: request.text.slice(0, 80), orchestrationMode,
+        createdAt: now, updatedAt: now }
+      : { ...existingConversation, orchestrationMode, updatedAt: now };
     persistence?.saveConversation(conversation);
     persistence?.saveMessage({ id: randomUUID(), conversationId: conversation.id, role: "user", content: request.text, createdAt: now });
     let resolvedAgentId = request.agentId;
@@ -652,7 +726,6 @@ function createWindow(): BrowserWindow {
 }
 
 void app.whenReady().then(() => {
-  secretStore = new SecretStore(join(app.getPath("userData"), "secrets.enc.json"));
   database = new SqliteDatabase(process.env.WAING_E2E === "1" ? ":memory:" : join(app.getPath("userData"), "waing.sqlite"));
   persistence = new PersistenceStore(database);
   persistence.recoverInterruptedSessions();
@@ -675,5 +748,5 @@ app.on("before-quit", () => {
 });
 app.on("will-quit", () => {
   if (attachmentTempDirectory !== undefined) rmSync(attachmentTempDirectory, { recursive: true, force: true });
-  database?.close(); database = undefined; persistence = undefined; workflowRepository = undefined; secretStore = undefined;
+  database?.close(); database = undefined; persistence = undefined; workflowRepository = undefined;
 });
